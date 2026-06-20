@@ -1,0 +1,20 @@
+# Swift 构建产物
+.build/
+.swiftpm/
+*.xcodeproj
+DerivedData/
+
+# Python 虚拟环境
+probe/.venv/
+__pycache__/
+*.pyc
+
+# 临时图标集(由 make_icon 生成)
+AppIcon.iconset/
+
+# 运行时/诊断
+debug.log
+*.log
+
+# macOS
+.DS_Store
