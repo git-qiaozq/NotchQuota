@@ -1,40 +1,50 @@
 # NotchQuota
 
-在 MacBook 刘海处实时查看 **Codex / Antigravity / Hermes** 三个 AI 平台的套餐用量。
+在 MacBook 刘海处实时查看 **Codex / Z.AI / Antigravity** 三个 AI 平台的套餐用量。
 
 鼠标划过刘海 → 面板像 Dynamic Island 一样从刘海胀开包裹刘海，展示三家用量；鼠标移开即收回。
 
-## 截图 / 能力
+## 能力
 
-- **Codex** — 5 小时窗口 + 周窗口的已用百分比、重置倒计时（从本地 session 快照读取）
-- **Antigravity** — Google One AI Pro 套餐层级（读取 keychain 里的 OAuth token 调 Cloud Code 内部接口）
-- **Hermes** — 近 30 天 token 用量、会话数、密钥到期时间（调 `hermes` CLI）
-- 每 60 秒自动刷新；点击任意卡片打开对应官网
+| 平台 | 数据 | 数据源 |
+|------|------|--------|
+| **Codex** | 5h 窗口 + 周窗口 已用百分比、重置倒计时 | `chatgpt.com/backend-api/wham/usage` 实时 API |
+| **Z.AI** | 5h 窗口 + 周窗口 已用百分比、重置倒计时 | `open.bigmodel.cn/api/monitor/usage/quota/limit` 实时 API |
+| **Antigravity** | 两模型组(Gemini / Claude&GPT)×(5h/周) 已用百分比 | `agy` CLI 的 `/usage` 命令(pty 驱动) |
+
+- 三家**全部实时**，每 60 秒自动刷新
+- 点击卡片跳转到对应平台的用量详情页
 - 完整生命周期：应用图标、设置窗口、开机自启开关、完全退出
 
 ## 它怎么工作
 
 ```
-quota_probe.py (Python)          Sources/NotchQuota (Swift/AppKit)
-┌──────────────────────┐         ┌─────────────────────────────┐
-│ 三家数据采集器        │ stdout  │  QuotaFetcher 调用脚本      │
-│ · Codex  session jsonl│ ──JSON──▶  ───────────────────────▶  │
-│ · Antigravity OAuth   │         │  PanelView 渲染三家卡片     │
-│ · Hermes   CLI        │         │  AppController 刘海热区/动画 │
-└──────────────────────┘         └─────────────────────────────┘
+quota_probe.py (Python)                Sources/NotchQuota (Swift/AppKit)
+┌──────────────────────────────┐       ┌─────────────────────────────────┐
+│ 三家数据采集器(统一 JSON)      │       │  QuotaFetcher 启动子进程         │
+│ · Codex      wham/usage API  │       │    ↓ stdout JSON                │
+│ · Z.AI       quota/limit API │──────▶│  PanelView 渲染三家卡片          │
+│ · Antigravity agy /usage     │       │  AppController 刘海热区/动画/轮询 │
+│   (agy_usage.py pty 驱动)    │       │  SettingsWindow 设置窗口         │
+└──────────────────────────────┘       └─────────────────────────────────┘
 ```
 
 数据采集逻辑独立于 UI，可单独运行：
 
 ```bash
-python3 probe/quota_probe.py     # 直接打印统一 JSON
+python3 probe/quota_probe.py     # 直接打印三家统一 JSON
 ```
 
 ## 依赖
 
 - macOS 13.0+（带刘海的 MacBook）
 - Swift 6.x（系统自带，或 Xcode Command Line Tools）
-- Python 3 + `cryptography`（用于 Antigravity 的 Chrome cookie 解密）
+- Python 3
+- `agy` CLI（Antigravity 官方，用于读取其用量）
+- 已登录配置：
+  - Codex：`~/.codex/auth.json`（Codex CLI 登录后自动生成）
+  - Z.AI：`~/.hermes/.env` 里的 `GLM_API_KEY`（或 `ZAI_API_KEY` 等）
+  - Antigravity：`agy` 已登录
 
 ## 构建
 
@@ -48,18 +58,22 @@ open ~/Applications/NotchQuota.app
 
 ## 使用
 
-- **划过刘海** → 弹出用量面板，移开即收
+- **划过刘海** → 弹出用量面板，移开即收（触控板惯性下不抖动）
 - **点击 app 图标**（运行中）→ 打开设置窗口
-- 设置窗口里：开机自启开关 / 完全退出
+- 设置窗口：开机自启拨片开关 / 完全退出
 - **关闭设置窗口**不会退出 app，刘海功能继续可用
 
 ## 管理
 
 ```bash
-# 重启
+# 重启（改完代码后）
 pkill -f NotchQuota.app; bash ~/NotchQuota/build_app.sh; open ~/Applications/NotchQuota.app
+
 # 关闭
 pkill -f NotchQuota.app
+
+# 单独看三家数据（不开 app）
+python3 ~/NotchQuota/probe/quota_probe.py
 ```
 
 ## 项目结构
@@ -67,24 +81,27 @@ pkill -f NotchQuota.app
 ```
 NotchQuota/
 ├── Package.swift
-├── build_app.sh              # 一键编译打包脚本
+├── build_app.sh                 # 一键编译打包脚本(含图标生成)
 ├── probe/
-│   ├── quota_probe.py        # 数据层:三家统一 JSON
+│   ├── quota_probe.py           # 数据层:三家统一 JSON 采集
+│   ├── agy_usage.py             # Antigravity: pty 驱动 agy + TUI 解析
 │   └── requirements.txt
 ├── scripts/
-│   └── make_icon.swift       # 图标生成器
+│   └── make_icon.swift          # 图标生成器
 └── Sources/NotchQuota/
-    ├── main.swift
-    ├── QuotaModel.swift      # 数据模型 + 采集器调用
-    ├── PanelView.swift       # 下拉面板视图
-    ├── AppController.swift   # 刘海热区/动画/生命周期
-    └── SettingsWindow.swift  # 设置窗口
+    ├── main.swift               # 入口
+    ├── QuotaModel.swift         # 数据模型 + 子进程调用(补全 PATH)
+    ├── PanelView.swift          # 下拉面板视图(进度条/卡片)
+    ├── AppController.swift      # 刘海热区/动画/轮询兜底/生命周期
+    └── SettingsWindow.swift     # 深色设置窗口
 ```
 
-## 已知限制
+## 实现要点
 
-- **Antigravity** 的 `loadCodeAssist` 接口只返回套餐层级，不返回配额百分比数字。读取 `gemini.google.com/usage` 的实时百分比需要走浏览器 Cookie 解密（代码框架已就绪）。
-- Codex 的用量是 session 中的快照（上次运行时），非严格实时。
+- **刘海贴合**：动态读取 `NSScreen.auxiliaryTopLeftArea/RightArea` 获取真实刘海几何，面板顶部顶到屏幕顶端包裹刘海
+- **触控板防抖**：收起判断不依赖单一 tracking area 事件，而是每次 `NSEvent.mouseLocation` 实测光标位置 + 0.15s 轮询兜底，避免惯性划过时反复弹出收回、长时间停留后事件丢失
+- **Antigravity**：直调 Google REST API 会因 keychain token 被 IDE 刷新丢失 Pro scope 而 403，故改用 pty 驱动 `agy` 本身（它自管 token/gRPC/license）
+- **GUI 子进程 PATH**：macOS GUI app 的子进程 PATH 默认不含 `~/.local/bin`，故 `agy`/`hermes` 需绝对路径 fallback + Swift 端补全 PATH
 
 ## License
 
