@@ -32,25 +32,40 @@ def _parse_usage(text: str) -> list:
         # 每个限额窗口: 进度条百分比 + remaining + Refreshes in
         limits = {}
         for win in ['Weekly Limit', 'Five Hour Limit']:
+            key = win.lower().replace(' ', '_')
+            # 格式1(常用): [进度条] X%  Y% remaining · Refreshes in Zh Wm
             wp = re.search(
                 rf'{win}\s*\n\s*\[[█░]+\]\s*([\d.]+)%\s*\n\s*(\d+)%\s*remaining'
                 rf'(?:.*?Refreshes in\s*([^\n]+?))?\s*\n',
                 block, re.S)
             if wp:
                 reset_raw = (wp.group(3) or '').strip().rstrip('.')
-                # 解析 "145h 31m" / "4h" / "31m" → 总小时数(用于后续换算成天)
                 hm = re.search(r'(?:(\d+)h)?\s*(?:(\d+)m)?', reset_raw)
                 total_h = None
                 if hm and (hm.group(1) or hm.group(2)):
                     h = int(hm.group(1) or 0)
                     m = int(hm.group(2) or 0)
                     total_h = round(h + m / 60, 2)
-                limits[win.lower().replace(' ', '_')] = {
+                limits[key] = {
                     'used_pct': round(100 - float(wp.group(2)), 1),
                     'remaining_pct': float(wp.group(2)),
                     'bar_pct': float(wp.group(1)),
                     'reset': reset_raw,
                     'reset_hours': total_h,
+                }
+                continue
+            # 格式2(配额充裕): [进度条] X%  Quota available
+            qa = re.search(
+                rf'{win}\s*\n\s*\[[█░]+\]\s*([\d.]+)%\s*\n\s*Quota available',
+                block, re.S)
+            if qa:
+                pct = float(qa.group(1))
+                limits[key] = {
+                    'used_pct': round(100 - pct, 1),
+                    'remaining_pct': pct,
+                    'bar_pct': pct,
+                    'reset': '',
+                    'reset_hours': None,
                 }
         if limits:
             groups.append({
