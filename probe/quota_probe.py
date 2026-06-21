@@ -101,160 +101,78 @@ def probe_codex() -> dict:
 
 
 # ───────────────────── Antigravity ─────────────────────
-# OAuth client 凭证不硬编码 —— 运行时从 Antigravity app bundle 动态提取
-# (避免泄露密钥,且 Antigravity 更新后自动跟随)
-
-def _ag_find_client_creds():
-    """从 Antigravity.app 的二进制里提取 OAuth client_id + secret。"""
-    import re as _re
-    paths = [
-        "/Applications/Antigravity.app/Contents/Resources/bin/language_server",
-        "/Applications/Antigravity.app/Contents/MacOS/Antigravity",
-        os.path.join(HOME, "Library/Application Support/Antigravity/bin/agy-node"),
-    ]
-    cid_pat = _re.compile(rb"(\d{10,}-[a-z0-9]+\.apps\.googleusercontent\.com)")
-    sec_pat = _re.compile(rb"(GOCSPX-[A-Za-z0-9_-]{20,})")
-    found = {}
-    for p in paths:
-        if not os.path.exists(p):
-            continue
-        try:
-            data = open(p, "rb").read()
-            cids = cid_pat.findall(data)
-            secs = sec_pat.findall(data)
-            if cids and secs:
-                # 配对:取第一组
-                cid = cids[0].decode()
-                sec = secs[0].decode()
-                found.setdefault("clients", []).append((cid, sec))
-        except Exception:
-            continue
-    return found.get("clients", [])
-
-def _ag_get_token():
-    """从 keychain 读 Antigravity OAuth token + expiry。"""
-    raw = subprocess.run(
-        ["security", "find-generic-password", "-s", "gemini",
-         "-a", "antigravity", "-w"],
-        capture_output=True, text=True, timeout=8,
-    ).stdout.strip()
-    if not raw:
-        return None
-    if raw.startswith("go-keyring-base64:"):
-        raw = raw[len("go-keyring-base64:"):]
-    return json.loads(base64.b64decode(raw))
-
-def _ag_refresh_token(refresh_token: str) -> str:
-    """用 Antigravity client 凭证刷新 access_token(不持久化,仅本次用)。"""
-    import urllib.request, urllib.parse
-    clients = _ag_find_client_creds()
-    for cid, sec in clients:
-        data = urllib.parse.urlencode({
-            "client_id": cid, "client_secret": sec,
-            "refresh_token": refresh_token, "grant_type": "refresh_token",
-        }).encode()
-        try:
-            r = urllib.request.urlopen(urllib.request.Request(
-                "https://oauth2.googleapis.com/token", data=data, method="POST"),
-                timeout=15)
-            return json.loads(r.read())["access_token"]
-        except Exception:
-            continue
-    return ""
-
-def _iso_to_epoch(s: str) -> float:
-    """ISO8601 → epoch。"""
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
-    except Exception:
-        return 0
+# 通过驱动 agy CLI 的 /usage 命令获取真实配额(agy 自行处理 token/gRPC/license)
+# 比直调 REST API 可靠 —— 后者会因 keychain token 被 IDE 刷新丢失 Pro scope 而 403
 
 def probe_antigravity() -> dict:
-    """调 Google retrieveUserQuota 取实时配额(按模型,取 Pro 最紧的)。
-    token 从 keychain 读;过期则尝试刷新,刷新失败降级到 loadCodeAssist 层级。"""
+    """驱动 agy /usage,解析 TUI 输出,返回两家模型组的周/5h 限额。"""
     out = {
-        "id": "antigravity", "name": "Antigravity", "plan": "—",
+        "id": "antigravity", "name": "Antigravity", "plan": "Google One AI Pro",
         "status": "error", "detail": "", "metrics": [],
         "url": "https://gemini.google.com/usage",
     }
-    import urllib.request, urllib.error
+    import sys
+    probe_dir = os.path.dirname(os.path.abspath(__file__))
+    if probe_dir not in sys.path:
+        sys.path.insert(0, probe_dir)
     try:
-        blob = _ag_get_token()
-        if not blob:
-            out["detail"] = "未登录(请在 Antigravity 内登录)"
-            return out
-        tok = blob.get("token", {})
-        access = tok.get("access_token", "")
-        refresh = tok.get("refresh_token", "")
-        expiry = tok.get("expiry", "")
+        from agy_usage import fetch_usage
+    except ImportError:
+        out["detail"] = "agy_usage.py 缺失"
+        return out
 
-        # 判断是否过期
-        expired = False
-        if expiry:
-            try:
-                exp = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
-                expired = exp < datetime.now(timezone.utc)
-            except Exception:
-                pass
+    result = fetch_usage()
+    if result.get("status") != "ok":
+        out["detail"] = result.get("detail", "未知错误")
+        return out
 
-        # 过期 → 尝试刷新
-        if expired and refresh:
-            new_access = _ag_refresh_token(refresh)
-            if new_access:
-                access = new_access
-                expired = False
+    groups = result.get("groups", [])
+    out["status"] = "ok"
+    out["detail"] = result.get("detail", "实时")
 
-        if not access:
-            out["detail"] = "无有效 token"
-            return out
+    def _fmt_reset_hours(h):
+        """小时数 → 'Xd Yh' 格式(不足1天则显示 'Xh Ym')。"""
+        if h is None:
+            return ""
+        if h >= 24:
+            d = int(h // 24)
+            rh = int(round(h - d * 24))
+            if rh >= 24:        # 四舍五入后满一天 → 进位
+                d += 1; rh -= 24
+            return f"{d}d{rh}h" if rh else f"{d}d"
+        hh = int(h)
+        mm = int(round((h - hh) * 60))
+        if mm >= 60:            # 同理,分钟满一小时 → 进位
+            hh += 1; mm -= 60
+        return f"{hh}h{mm}m" if mm else f"{hh}h"
 
-        headers = {"Authorization": f"Bearer {access}",
-                   "Content-Type": "application/json"}
-
-        # 主路径:retrieveUserQuota → 每模型实时配额
-        try:
-            req = urllib.request.Request(
-                "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
-                data=json.dumps({}).encode(), headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=15) as r:
-                data = json.loads(r.read())
-
-            buckets = data.get("buckets", [])
-            # 取 Pro 模型里剩余最少的(最紧约束)
-            pros = [b for b in buckets if "pro" in b.get("modelId", "").lower()]
-            target = pros or buckets
-            target.sort(key=lambda x: x.get("remainingFraction", 1))
-
-            out["plan"] = "Google One AI Pro"
-            out["status"] = "ok"
-            out["detail"] = "实时"
-            for b in target[:2]:
-                remain = b.get("remainingFraction", 1)
-                used = round((1 - remain) * 100, 1)
-                mid = b.get("modelId", "").replace("gemini-", "")
-                reset = _human_reset(_iso_to_epoch(b.get("resetTime", "")))
-                out["metrics"].append({
-                    "label": mid, "used_pct": used, "reset": reset,
-                })
-            return out
-        except urllib.error.HTTPError:
-            pass  # token 无 Pro 许可或其它 → 降级到 loadCodeAssist
-
-        # 降级:loadCodeAssist → 只取套餐层级
-        req = urllib.request.Request(
-            "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
-            data=json.dumps({"metadata": {"pluginType": "GEMINI"}}).encode(),
-            headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=15) as r:
-            data = json.loads(r.read())
-        paid = data.get("paidTier", {}).get("name") or data.get("currentTier", {}).get("name", "")
-        out["plan"] = paid or "Gemini Code Assist"
-        out["status"] = "ok"
-        out["detail"] = "仅层级(配额接口无权限)" if expired else "仅层级"
-    except Exception as e:
-        out["detail"] = f"{type(e).__name__}"
+    # 每个模型组按固定顺序显示: 5h 窗口在上, 周窗口在下(和 Codex 统一)
+    for g in groups:
+        five_h = g.get("five_hour_limit", {})
+        weekly = g.get("weekly_limit", {})
+        if not five_h and not weekly:
+            continue
+        # 组名简化: GEMINI MODELS → Gemini / CLAUDE AND GPT MODELS → Claude&GPT
+        short = g["group"].replace("MODELS", "").strip()
+        if "CLAUDE" in short:
+            short = "Claude&GPT"
+        elif "GEMINI" in short:
+            short = "Gemini"
+        # 5h 窗口(直接用 agy 的原始 'Xh Ym')
+        if five_h:
+            out["metrics"].append({
+                "label": f"{short} 5h",
+                "used_pct": five_h["used_pct"],
+                "reset": five_h.get("reset", ""),
+            })
+        # 周窗口(换算成 'Xd Yh')
+        if weekly:
+            out["metrics"].append({
+                "label": f"{short} 周",
+                "used_pct": weekly["used_pct"],
+                "reset": _fmt_reset_hours(weekly.get("reset_hours")),
+            })
     return out
-
 
 # ─────────────────────── Hermes ───────────────────────
 def probe_hermes() -> dict:
