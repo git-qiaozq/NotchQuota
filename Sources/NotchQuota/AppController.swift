@@ -1,6 +1,6 @@
 import AppKit
 
-// 刘海专用窗口：不可成为 key/main
+// 刘海专用窗口:不可成为 key/main
 final class NotchWindow: NSWindow {
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
@@ -112,6 +112,14 @@ final class AppController: NSObject, NSApplicationDelegate {
         panelWindow.isOpaque = false
         panelWindow.hasShadow = true
         panelWindow.isMovable = false
+        // 自定义阴影:四边都有投影形成自然边界,但顶部投影会被刘海实体遮挡
+        // (窗口顶部紧贴屏幕顶,顶部阴影被刘海盖住 → 不会出现割裂白线)
+        if let cl = panelWindow.contentView?.layer {
+            cl.shadowColor = NSColor.black.cgColor
+            cl.shadowOpacity = 0.45
+            cl.shadowRadius = 12
+            cl.shadowOffset = NSSize(width: 0, height: -4)
+        }
         panelWindow.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
 
         // notchInset = 刘海高度 → 顶部留出刘海融合区,内容沉到刘海底边以下
@@ -120,6 +128,9 @@ final class AppController: NSObject, NSApplicationDelegate {
             notchInset: g.height
         )
         let container = HoverView(frame: NSRect(x: 0, y: 0, width: panelWidth, height: 400))
+        // 容器透明,完全由 PanelView 负责形状和颜色(避免容器白底露出边框线)
+        container.wantsLayer = true
+        container.layer?.backgroundColor = .clear
         container.onEnter = { [weak self] in self?.cancelClose() }     // 进面板 → 保持
         container.onExit  = { [weak self] in self?.requestClose() }    // 离面板 → 查活跃区后决定
         panelView.frame = container.bounds
@@ -143,10 +154,9 @@ final class AppController: NSObject, NSApplicationDelegate {
         panelView.render(services, updated: lastUpdate)
         // fittingSize 已含 notchInset → 总高度 = 刘海融合区 + 内容
         let totalH = panelView.fittingSize.height
-
-        // 目标:顶部 y = sf.maxY(贴屏幕顶,包裹刘海) → origin.y = sf.maxY - totalH
+        // 目标:顶部超出屏幕顶 2pt,刚好盖住那条 1px 边线,不浪费可视空间
         let target = NSRect(x: g.center - panelWidth / 2,
-                            y: sf.maxY - totalH,
+                            y: sf.maxY - totalH + 2,
                             width: panelWidth, height: totalH)
         currentTargetFrame = target
         // 起始:完全藏在屏幕顶外

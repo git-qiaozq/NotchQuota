@@ -11,9 +11,8 @@ final class PanelView: NSView {
         self.notchInset = notchInset
         super.init(frame: .zero)
         wantsLayer = true
-        // 近纯黑:和刘海融合成一体
-        layer?.backgroundColor = NSColor(white: 0.04, alpha: 0.98).cgColor
-        // 大圆角药丸形(四角都圆) → 刘海嵌在顶部中央
+        // 纯黑不透明背景,四角大圆角药丸形(刘海嵌在顶部中央)
+        layer?.backgroundColor = NSColor(white: 0.04, alpha: 1).cgColor
         layer?.cornerRadius = 22
         layer?.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner,
                                  .layerMinXMaxYCorner, .layerMaxXMaxYCorner]
