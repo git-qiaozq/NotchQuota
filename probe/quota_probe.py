@@ -174,51 +174,84 @@ def probe_antigravity() -> dict:
             })
     return out
 
-# ─────────────────────── Hermes ───────────────────────
+# ─────────────────────── Z.AI / GLM ───────────────────────
+# Hermes 当前用 Z.AI/GLM 作为 provider,改用其 API key 查 coding plan 真实配额
+# key 从 Hermes .env 读(GLM_API_KEY / ZAI_API_KEY / Z_AI_API_KEY)
+
+def _zai_find_key() -> str:
+    """从 Hermes .env 读 Z.AI/GLM API key。"""
+    env = os.path.join(HOME, ".hermes", ".env")
+    if not os.path.exists(env):
+        return ""
+    import re as _re
+    keys = ["GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY", "ZHIPUAI_API_KEY"]
+    pat = _re.compile(r'\s*(' + '|'.join(keys) + r')\s*=\s*["\']?([A-Za-z0-9._\-]+)')
+    with open(env) as f:
+        for line in f:
+            m = pat.match(line)
+            if m:
+                return m.group(2)
+    return ""
+
+
 def probe_hermes() -> dict:
-    """调 hermes insights 取 token 用量, hermes status 取订阅到期。"""
+    """调智谱 coding plan 用量 API,返回 5h/周窗口的真实配额。"""
     out = {
-        "id": "hermes", "name": "Hermes", "plan": "Nous Portal",
+        "id": "hermes", "name": "Z.AI", "plan": "Coding Plan",
         "status": "error", "detail": "", "metrics": [],
-        "url": "https://portal.nousresearch.com",
+        "url": "https://open.bigmodel.cn/",
     }
     try:
-        hermes = os.path.join(HOME, ".local", "bin", "hermes")
-        if not os.path.exists(hermes):
-            hermes = "hermes"
+        key = _zai_find_key()
+        if not key:
+            out["detail"] = "未配置 Z.AI key"
+            return out
 
-        ins = subprocess.run([hermes, "insights"], capture_output=True,
-                             text=True, timeout=25).stdout
-        # 去 ANSI
-        ins = re.sub(r"\x1b\[[0-9;]*m", "", ins)
+        import urllib.request, urllib.error
+        req = urllib.request.Request(
+            "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
+            headers={"Authorization": f"Bearer {key}", "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            code = e.code
+            out["detail"] = "key 无效" if code == 401 else f"HTTP {code}"
+            return out
+
+        limits = data.get("data", {}).get("limits", [])
         metrics = []
-        m = re.search(r"Total tokens:\s*([\d,]+)", ins)
-        if m:
-            metrics.append({"label": "30天 token", "text": m.group(1)})
-        m = re.search(r"Sessions:\s*(\d+)", ins)
-        if m:
-            metrics.append({"label": "会话", "text": m.group(1)})
+        # TOKENS_LIMIT: unit=3 是 5h 窗口, unit=6 是周窗口
+        five_h, weekly = None, None
+        for L in limits:
+            if L.get("type") != "TOKENS_LIMIT":
+                continue
+            unit = L.get("unit")
+            pct = L.get("percentage", 0)
+            reset_epoch = (L.get("nextResetTime") or 0) / 1000
+            reset_str = _human_reset(reset_epoch)
+            entry = {"used_pct": float(pct), "reset": reset_str}
+            if unit == 3:
+                five_h = entry
+            elif unit == 6:
+                weekly = entry
 
-        st = subprocess.run([hermes, "status"], capture_output=True,
-                            text=True, timeout=25).stdout
-        st = re.sub(r"\x1b\[[0-9;]*m", "", st)
-        m = re.search(r"Access exp:\s*([\d\-: ]+\w*)", st)
-        if m:
-            metrics.append({"label": "密钥到期", "text": m.group(1).strip()})
+        # 固定顺序: 5h 在上、周在下(和 Codex/Antigravity 统一)
+        if five_h:
+            metrics.append({"label": "5h 窗口", **five_h})
+        if weekly:
+            metrics.append({"label": "周窗口", **weekly})
 
-        if metrics:
-            out["metrics"] = metrics
-            out["status"] = "ok"
-            out["detail"] = "本地用量统计"
-        else:
-            out["detail"] = "无法解析 insights"
+        out["metrics"] = metrics
+        out["status"] = "ok"
+        out["detail"] = "实时"
     except Exception as e:
         out["detail"] = f"{type(e).__name__}"
     return out
 
 
 def main():
-    result = [probe_codex(), probe_antigravity(), probe_hermes()]
+    result = [probe_codex(), probe_hermes(), probe_antigravity()]
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
