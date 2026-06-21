@@ -45,6 +45,13 @@ enum QuotaFetcher {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         proc.arguments = ["python3", probePath]
+        // GUI app 的 PATH 默认不含 ~/.local/bin(hermes/agy 所在) → 补全
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        var env = ProcessInfo.processInfo.environment
+        let extraPaths = ["\(home)/.local/bin", "/opt/homebrew/bin", "/usr/local/bin"]
+        let existing = env["PATH"] ?? "/usr/bin:/bin"
+        env["PATH"] = (extraPaths.joined(separator: ":") + ":" + existing)
+        proc.environment = env
         let pipe = Pipe()
         proc.standardOutput = pipe
         proc.standardError = Pipe()

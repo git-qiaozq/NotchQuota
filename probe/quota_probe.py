@@ -40,7 +40,7 @@ def probe_codex() -> dict:
     out = {
         "id": "codex", "name": "Codex", "plan": "ChatGPT Plan",
         "status": "error", "detail": "", "metrics": [],
-        "url": "https://chatgpt.com/codex",
+        "url": "https://chatgpt.com/codex/cloud/settings/analytics",
     }
     try:
         auth_path = os.path.join(HOME, ".codex", "auth.json")
@@ -199,7 +199,7 @@ def probe_hermes() -> dict:
     out = {
         "id": "hermes", "name": "Z.AI", "plan": "Coding Plan",
         "status": "error", "detail": "", "metrics": [],
-        "url": "https://open.bigmodel.cn/",
+        "url": "https://open.bigmodel.cn/coding-plan/personal/usage",
     }
     try:
         key = _zai_find_key()

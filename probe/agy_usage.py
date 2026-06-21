@@ -61,10 +61,24 @@ def _parse_usage(text: str) -> list:
     return groups
 
 
+def _resolve_agy() -> str:
+    """解析 agy 的绝对路径。PATH 找不到时 fallback 到 ~/.local/bin/agy。"""
+    import shutil
+    p = shutil.which("agy")
+    if p:
+        return p
+    # GUI app 的子进程 PATH 可能不含 ~/.local/bin → fallback
+    fallback = os.path.expanduser("~/.local/bin/agy")
+    if os.path.exists(fallback):
+        return fallback
+    return "agy"   # 让 execvp 报原始错误
+
+
 def fetch_usage(timeout_total: int = 28) -> dict:
     """驱动 agy /usage,返回解析后的结构化配额。
     返回 {status, detail, groups:[...]} 或 {status:'error', detail}。"""
     try:
+        agy_path = _resolve_agy()
         master, slave = pty.openpty()
         pid = os.fork()
         if pid == 0:
@@ -74,7 +88,7 @@ def fetch_usage(timeout_total: int = 28) -> dict:
             import fcntl, termios, struct
             fcntl.ioctl(slave, termios.TIOCSWINSZ,
                         struct.pack('HHHH', 60, 160, 0, 0))
-            os.execvp('agy', ['agy'])
+            os.execvp(agy_path, [agy_path])
         os.close(slave)
 
         buf = b''
