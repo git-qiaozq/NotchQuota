@@ -186,7 +186,17 @@ def _kill_child_if_running(pid: int) -> None:
 _RUNTIME_DIR = os.path.join(os.path.expanduser("~"), ".cache", "notchquota")
 _SOCKET_PATH = os.path.join(_RUNTIME_DIR, "agy_daemon.sock")
 _LOCK_PATH = os.path.join(_RUNTIME_DIR, "agy_daemon.lock")
+_DAEMON_LOCK_PATH = os.path.join(_RUNTIME_DIR, "agy_daemon.run.lock")
 _LOG_PATH = os.path.join(_RUNTIME_DIR, "agy_daemon.log")
+
+
+def _network_ready() -> bool:
+    for host in ("daily-cloudcode-pa.googleapis.com", "www.googleapis.com"):
+        try:
+            socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        except OSError:
+            return False
+    return True
 
 
 class _AgySession:
@@ -271,18 +281,20 @@ class _AgySession:
             self._read_for(0.3)
             txt = self.buf.decode('utf-8', 'replace')
             if not self.login_selected and 'Select login method:' in txt and 'Google OAuth' in txt:
-                try:
-                    os.write(self.master, b'\r')
-                    self.login_selected = True
-                    self._log("selected Google OAuth login method")
-                    time.sleep(0.5)
-                except OSError:
-                    pass
+                self.login_selected = True
+                self._log("agy is waiting for manual login")
             if ('AI Pro' in txt or 'Pro (High)' in txt) and time.time() - self.started_at > 5:
                 return True
         return False
 
     def _auth_waiting_result(self, text: str):
+        if 'Select login method:' in text and 'Google OAuth' in text:
+            self._log("waiting for manual Antigravity login")
+            return {
+                'status': 'error',
+                'detail': '等待手动登录 Antigravity',
+                'raw': text[-800:] if text else '',
+            }
         if 'paste the authorization code' in text or 'accounts.google.com/o/oauth2' in text:
             self._log("waiting for OAuth authorization code")
             return {
@@ -292,13 +304,34 @@ class _AgySession:
             }
         return None
 
+    def _startup_retry_reason(self, text: str):
+        checks = [
+            ('no such host', 'dns not ready'),
+            ('network is unreachable', 'network not ready'),
+            ('temporary failure in name resolution', 'dns not ready'),
+            ('keyringAuth: timed out', 'keyring timed out'),
+        ]
+        lower = text.lower()
+        for needle, reason in checks:
+            if needle.lower() in lower:
+                return reason
+        return None
+
     def fetch_usage(self, timeout_total: int = 28) -> dict:
         with self.lock:
             try:
                 if not self._is_running():
                     self._start()
-                if not self._wait_ready(max(8, timeout_total - 10)):
+                ready = self._wait_ready(max(8, timeout_total - 10))
+                if not ready:
                     text = _clean(self.buf.decode('utf-8', 'replace'))
+                    retry_reason = self._startup_retry_reason(text)
+                    if retry_reason:
+                        self._log(f"restarting agy after startup failure: {retry_reason}")
+                        self._start()
+                        ready = self._wait_ready(max(8, timeout_total - 10))
+                        text = _clean(self.buf.decode('utf-8', 'replace'))
+                if not ready:
                     auth_waiting = self._auth_waiting_result(text)
                     if auth_waiting:
                         return auth_waiting
@@ -366,6 +399,12 @@ def _daemon_log(msg: str) -> None:
 
 def _run_daemon() -> None:
     os.makedirs(_RUNTIME_DIR, exist_ok=True)
+    run_lock = open(_DAEMON_LOCK_PATH, "w")
+    try:
+        fcntl.flock(run_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        _daemon_log("daemon already running; exiting")
+        return
     try:
         os.unlink(_SOCKET_PATH)
     except FileNotFoundError:
@@ -456,6 +495,8 @@ def _ensure_daemon(timeout: float = 20) -> dict:
 
 def fetch_usage(timeout_total: int = 28) -> dict:
     """通过常驻 agy daemon 实时发送 /usage 并返回结构化配额。"""
+    if not _network_ready():
+        return {'status': 'error', 'detail': '网络未就绪'}
     ready = _ensure_daemon()
     if ready.get("status") != "ok":
         return ready
