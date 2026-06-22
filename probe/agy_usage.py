@@ -3,8 +3,9 @@ agy_usage.py — 驱动 agy CLI 的 /usage 命令抓取真实配额。
 agy 自己处理 OAuth token 刷新 + gRPC + Pro license,比直调 REST API 可靠。
 
 原理:用 pty 模拟交互式会话,登录后发 /usage,解析 TUI 文本输出。
+为了避免每分钟启动 agy 触发 OAuth 窗口,这里通过本地 daemon 复用同一个 agy 会话。
 """
-import os, pty, select, time, re, signal
+import os, pty, select, time, re, signal, sys, socket, subprocess, json, threading, fcntl
 
 
 def _clean(text: str) -> str:
@@ -68,13 +69,18 @@ def _parse_usage(text: str) -> list:
                     'reset_hours': None,
                 }
         if limits:
-            # 按组名去重:agy TUI 刷新时会在 buffer 里重复绘制,只保留第一份
-            if not any(g['group'] == group_title for g in groups):
-                groups.append({
-                    'group': group_title,
-                    'models': models,
-                    **limits,
-                })
+            # 按组名去重:agy TUI 会重复绘制;保留最后一份,避免 daemon 长缓冲返回旧数据
+            entry = {
+                'group': group_title,
+                'models': models,
+                **limits,
+            }
+            for i, g in enumerate(groups):
+                if g['group'] == group_title:
+                    groups[i] = entry
+                    break
+            else:
+                groups.append(entry)
     return groups
 
 
@@ -177,12 +183,33 @@ def _kill_child_if_running(pid: int) -> None:
     _wait_child(pid, 1)
 
 
-def fetch_usage(timeout_total: int = 28) -> dict:
-    """驱动 agy /usage,返回解析后的结构化配额。
-    返回 {status, detail, groups:[...]} 或 {status:'error', detail}。"""
-    master = None
-    pid = None
-    try:
+_RUNTIME_DIR = os.path.join(os.path.expanduser("~"), ".cache", "notchquota")
+_SOCKET_PATH = os.path.join(_RUNTIME_DIR, "agy_daemon.sock")
+_LOCK_PATH = os.path.join(_RUNTIME_DIR, "agy_daemon.lock")
+_LOG_PATH = os.path.join(_RUNTIME_DIR, "agy_daemon.log")
+
+
+class _AgySession:
+    def __init__(self):
+        self.master = None
+        self.pid = None
+        self.buf = b''
+        self.started_at = 0.0
+        self.sent_once = False
+        self.login_selected = False
+        self.lock = threading.Lock()
+        self._start()
+
+    def _log(self, msg: str) -> None:
+        try:
+            os.makedirs(_RUNTIME_DIR, exist_ok=True)
+            with open(_LOG_PATH, "a") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+        except Exception:
+            pass
+
+    def _start(self) -> None:
+        self.close()
         agy_path = _resolve_agy()
         master, slave = pty.openpty()
         pid = os.fork()
@@ -198,69 +225,248 @@ def fetch_usage(timeout_total: int = 28) -> dict:
             except OSError:
                 os._exit(127)
         os.close(slave)
+        self.master = master
+        self.pid = pid
+        self.buf = b''
+        self.started_at = time.time()
+        self.sent_once = False
+        self.login_selected = False
+        self._log(f"started agy pid={pid}")
 
-        buf = b''
-        start = time.time()
-        sent = False
-        sent_t = 0
-        while time.time() - start < timeout_total:
-            r, _, _ = select.select([master], [], [], 0.3)
+    def _is_running(self) -> bool:
+        if self.pid is None:
+            return False
+        try:
+            done, _ = os.waitpid(self.pid, os.WNOHANG)
+        except OSError:
+            return False
+        if done == 0:
+            return True
+        self.pid = None
+        return False
+
+    def _read_for(self, duration: float) -> None:
+        deadline = time.time() + duration
+        while time.time() < deadline and self.master is not None:
+            try:
+                r, _, _ = select.select([self.master], [], [], 0.15)
+            except OSError:
+                break
             if r:
                 try:
-                    data = os.read(master, 4096)
+                    data = os.read(self.master, 4096)
                 except OSError:
                     break
                 if not data:
                     break
-                buf += data
-            txt = buf.decode('utf-8', 'replace')
-            # 登录完成标志:看到邮箱 + Pro + 等几秒让 TUI 就绪
-            if not sent and ('AI Pro' in txt or 'Pro (High)' in txt) \
-                    and time.time() - start > 6:
-                time.sleep(0.8)
-                # 发 esc 关补全菜单,再逐字符发 /usage
-                os.write(master, b'\x1b')
-                time.sleep(0.3)
-                for ch in '/usage':
-                    os.write(master, ch.encode())
-                    time.sleep(0.05)
-                time.sleep(0.3)
-                os.write(master, b'\r')
-                sent = True
-                sent_t = time.time()
-            # /usage 发出后等数据回来
-            if sent and time.time() - sent_t > 7:
-                break
+                self.buf += data
+                if len(self.buf) > 200_000:
+                    self.buf = self.buf[-120_000:]
 
-        # 收尾:不要立刻 SIGKILL，避免打断 agy 写回 OAuth/Keychain 状态。
-        buf = _shutdown_agy(pid, master, buf)
-        try:
-            os.close(master)
-        except OSError:
-            pass
-        master = None
+    def _wait_ready(self, timeout: float) -> bool:
+        start = time.time()
+        while time.time() - start < timeout:
+            if not self._is_running():
+                self._start()
+            self._read_for(0.3)
+            txt = self.buf.decode('utf-8', 'replace')
+            if not self.login_selected and 'Select login method:' in txt and 'Google OAuth' in txt:
+                try:
+                    os.write(self.master, b'\r')
+                    self.login_selected = True
+                    self._log("selected Google OAuth login method")
+                    time.sleep(0.5)
+                except OSError:
+                    pass
+            if ('AI Pro' in txt or 'Pro (High)' in txt) and time.time() - self.started_at > 5:
+                return True
+        return False
 
-        text = _clean(buf.decode('utf-8', 'replace'))
-        groups = _parse_usage(text)
-        if groups:
-            return {'status': 'ok', 'detail': '实时(agy)', 'groups': groups}
-        # 解析失败 → 返回原始文本片段便于调试
-        snippet = text[-800:] if text else "(无输出)"
-        return {'status': 'error', 'detail': '解析失败', 'raw': snippet}
-    except FileNotFoundError:
-        return {'status': 'error', 'detail': '未安装 agy'}
-    except Exception as e:
-        return {'status': 'error', 'detail': f'{type(e).__name__}: {e}'}
-    finally:
-        if master is not None:
+    def _auth_waiting_result(self, text: str):
+        if 'paste the authorization code' in text or 'accounts.google.com/o/oauth2' in text:
+            self._log("waiting for OAuth authorization code")
+            return {
+                'status': 'error',
+                'detail': '等待 Antigravity OAuth 一次性授权',
+                'raw': text[-800:] if text else '',
+            }
+        return None
+
+    def fetch_usage(self, timeout_total: int = 28) -> dict:
+        with self.lock:
             try:
-                os.close(master)
+                if not self._is_running():
+                    self._start()
+                if not self._wait_ready(max(8, timeout_total - 10)):
+                    text = _clean(self.buf.decode('utf-8', 'replace'))
+                    auth_waiting = self._auth_waiting_result(text)
+                    if auth_waiting:
+                        return auth_waiting
+                    return {'status': 'error', 'detail': 'agy 未就绪', 'raw': text[-800:] if text else ''}
+
+                marker = f"__NOTCHQUOTA_USAGE_{int(time.time() * 1000)}__"
+                self.buf += f"\n{marker}\n".encode()
+                os.write(self.master, b'\x1b')
+                time.sleep(0.15)
+                os.write(self.master, b'\x15')
+                time.sleep(0.05)
+                for ch in '/usage':
+                    os.write(self.master, ch.encode())
+                    time.sleep(0.03)
+                os.write(self.master, b'\r')
+                self.sent_once = True
+
+                deadline = time.time() + 9
+                groups = []
+                text = ''
+                while time.time() < deadline:
+                    self._read_for(0.3)
+                    text = _clean(self.buf.decode('utf-8', 'replace'))
+                    recent = text.split(marker, 1)[-1]
+                    groups = _parse_usage(recent)
+                    if groups and time.time() < deadline - 1:
+                        # 多等一小会儿让 TUI 刷新完整,然后取最后一次绘制
+                        self._read_for(1.0)
+                        text = _clean(self.buf.decode('utf-8', 'replace'))
+                        recent = text.split(marker, 1)[-1]
+                        groups = _parse_usage(recent)
+                        break
+                if groups:
+                    return {'status': 'ok', 'detail': '实时(agy daemon)', 'groups': groups}
+                return {'status': 'error', 'detail': '解析失败', 'raw': text[-800:] if text else '(无输出)'}
+            except Exception as e:
+                self._log(f"fetch error {type(e).__name__}: {e}")
+                return {'status': 'error', 'detail': f'{type(e).__name__}: {e}'}
+
+    def close(self) -> None:
+        if self.master is not None and self.pid is not None:
+            try:
+                _shutdown_agy(self.pid, self.master, self.buf)
+            except Exception:
+                _kill_child_if_running(self.pid)
+        elif self.pid is not None:
+            _kill_child_if_running(self.pid)
+        if self.master is not None:
+            try:
+                os.close(self.master)
             except OSError:
                 pass
-        if pid is not None:
-            _kill_child_if_running(pid)
+        self.master = None
+        self.pid = None
+
+
+def _daemon_log(msg: str) -> None:
+    try:
+        os.makedirs(_RUNTIME_DIR, exist_ok=True)
+        with open(_LOG_PATH, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except Exception:
+        pass
+
+
+def _run_daemon() -> None:
+    os.makedirs(_RUNTIME_DIR, exist_ok=True)
+    try:
+        os.unlink(_SOCKET_PATH)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(_SOCKET_PATH)
+    os.chmod(_SOCKET_PATH, 0o600)
+    server.listen(4)
+    session = _AgySession()
+    last_seen = time.time()
+    _daemon_log("daemon ready")
+
+    def handle(conn):
+        nonlocal last_seen
+        with conn:
+            last_seen = time.time()
+            cmd = conn.recv(64).decode('utf-8', 'replace').strip()
+            if cmd == "usage":
+                result = session.fetch_usage()
+            elif cmd == "ping":
+                result = {"status": "ok", "detail": "pong"}
+            else:
+                result = {"status": "error", "detail": "未知命令"}
+            conn.sendall(json.dumps(result, ensure_ascii=False).encode() + b"\n")
+
+    try:
+        while True:
+            if time.time() - last_seen > 12 * 3600:
+                _daemon_log("idle timeout")
+                break
+            server.settimeout(5)
+            try:
+                conn, _ = server.accept()
+            except socket.timeout:
+                continue
+            threading.Thread(target=handle, args=(conn,), daemon=True).start()
+    finally:
+        session.close()
+        server.close()
+        try:
+            os.unlink(_SOCKET_PATH)
+        except OSError:
+            pass
+
+
+def _daemon_request(cmd: str, timeout: float) -> dict:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        s.connect(_SOCKET_PATH)
+        s.sendall(cmd.encode() + b"\n")
+        chunks = []
+        while True:
+            data = s.recv(65536)
+            if not data:
+                break
+            chunks.append(data)
+        return json.loads(b''.join(chunks).decode('utf-8'))
+
+
+def _ensure_daemon(timeout: float = 20) -> dict:
+    os.makedirs(_RUNTIME_DIR, exist_ok=True)
+    with open(_LOCK_PATH, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            return _daemon_request("ping", 2)
+        except Exception:
+            try:
+                os.unlink(_SOCKET_PATH)
+            except OSError:
+                pass
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--daemon"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        deadline = time.time() + timeout
+        last_err = None
+        while time.time() < deadline:
+            try:
+                return _daemon_request("ping", 2)
+            except Exception as e:
+                last_err = e
+                time.sleep(0.3)
+        return {"status": "error", "detail": f"agy daemon 启动失败: {last_err}"}
+
+
+def fetch_usage(timeout_total: int = 28) -> dict:
+    """通过常驻 agy daemon 实时发送 /usage 并返回结构化配额。"""
+    ready = _ensure_daemon()
+    if ready.get("status") != "ok":
+        return ready
+    try:
+        return _daemon_request("usage", timeout_total + 5)
+    except Exception as e:
+        return {'status': 'error', 'detail': f'daemon 请求失败: {type(e).__name__}: {e}'}
 
 
 if __name__ == '__main__':
-    import json
-    print(json.dumps(fetch_usage(), ensure_ascii=False, indent=2))
+    if len(sys.argv) > 1 and sys.argv[1] == "--daemon":
+        _run_daemon()
+    else:
+        print(json.dumps(fetch_usage(), ensure_ascii=False, indent=2))
