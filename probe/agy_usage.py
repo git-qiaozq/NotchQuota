@@ -68,11 +68,13 @@ def _parse_usage(text: str) -> list:
                     'reset_hours': None,
                 }
         if limits:
-            groups.append({
-                'group': group_title,
-                'models': models,
-                **limits,
-            })
+            # 按组名去重:agy TUI 刷新时会在 buffer 里重复绘制,只保留第一份
+            if not any(g['group'] == group_title for g in groups):
+                groups.append({
+                    'group': group_title,
+                    'models': models,
+                    **limits,
+                })
     return groups
 
 
