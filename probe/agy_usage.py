@@ -418,9 +418,10 @@ def _run_daemon() -> None:
     session = _AgySession()
     last_seen = time.time()
     _daemon_log("daemon ready")
+    shutting_down = False
 
     def handle(conn):
-        nonlocal last_seen
+        nonlocal last_seen, shutting_down
         with conn:
             last_seen = time.time()
             cmd = conn.recv(64).decode('utf-8', 'replace').strip()
@@ -428,12 +429,17 @@ def _run_daemon() -> None:
                 result = session.fetch_usage()
             elif cmd == "ping":
                 result = {"status": "ok", "detail": "pong"}
+            elif cmd == "shutdown":
+                # 请求 NotchQuota 退出时优雅关闭 daemon + agy,避免遗留孤儿进程
+                shutting_down = True
+                _daemon_log("received shutdown; exiting")
+                result = {"status": "ok", "detail": "shutting down"}
             else:
                 result = {"status": "error", "detail": "未知命令"}
             conn.sendall(json.dumps(result, ensure_ascii=False).encode() + b"\n")
 
     try:
-        while True:
+        while True and not shutting_down:
             if time.time() - last_seen > 12 * 3600:
                 _daemon_log("idle timeout")
                 break

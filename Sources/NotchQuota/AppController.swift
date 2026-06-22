@@ -71,6 +71,12 @@ final class AppController: NSObject, NSApplicationDelegate {
         return false
     }
 
+    // ── app 退出时优雅关闭 agy daemon,避免遗留孤儿进程 ──
+    // daemon 收到 shutdown 会终止它托管的 agy 会话并清理 socket
+    func applicationWillTerminate(_ notification: Notification) {
+        QuotaFetcher.shutdownDaemon()
+    }
+
     // ── 热区:覆盖刘海本身 + 下方一小条,左右宽容 ──
     // 鼠标划过刘海即触发,无需停留
     private func setupHotZone(screen: NSScreen) {
