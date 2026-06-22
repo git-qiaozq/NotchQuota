@@ -4,7 +4,7 @@ agy 自己处理 OAuth token 刷新 + gRPC + Pro license,比直调 REST API 可�
 
 原理:用 pty 模拟交互式会话,登录后发 /usage,解析 TUI 文本输出。
 """
-import os, pty, select, time, re
+import os, pty, select, time, re, json
 
 
 def _clean(text: str) -> str:
@@ -91,9 +91,55 @@ def _resolve_agy() -> str:
     return "agy"   # 让 execvp 报原始错误
 
 
+_CACHE_PATH = os.path.join(os.path.expanduser("~"), ".cache", "notchquota_agy.json")
+_CACHE_TTL = 300  # 5 分钟:agy 启动+OAuth 成本高且易触发登录弹窗,拉长调用间隔
+
+
+def _read_cache():
+    """读缓存,TTL 内且有效则返回,否则 None。"""
+    try:
+        if not os.path.exists(_CACHE_PATH):
+            return None
+        age = time.time() - os.path.getmtime(_CACHE_PATH)
+        if age > _CACHE_TTL:
+            return None
+        with open(_CACHE_PATH) as f:
+            d = json.load(f)
+        if d.get("status") == "ok":
+            d["detail"] = f"{d.get('detail','缓存')} · 缓存{int(age)}s"
+            return d
+    except Exception:
+        pass
+    return None
+
+
+def _write_cache(d: dict) -> None:
+    """写缓存(仅成功结果)。"""
+    try:
+        os.makedirs(os.path.dirname(_CACHE_PATH), exist_ok=True)
+        with open(_CACHE_PATH, "w") as f:
+            json.dump(d, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
 def fetch_usage(timeout_total: int = 28) -> dict:
     """驱动 agy /usage,返回解析后的结构化配额。
-    返回 {status, detail, groups:[...]} 或 {status:'error', detail}。"""
+    返回 {status, detail, groups:[...]} 或 {status:'error', detail}。
+    带 5 分钟文件缓存:避免频繁启动 agy 触发 OAuth 登录弹窗。"""
+    # 先查缓存:命中直接返回,不再启动 agy
+    cached = _read_cache()
+    if cached:
+        return cached
+    result = _fetch_usage_fresh(timeout_total)
+    # 仅成功的有效结果才缓存(失败的每次重试,避免卡住)
+    if result.get("status") == "ok":
+        _write_cache(result)
+    return result
+
+
+def _fetch_usage_fresh(timeout_total: int = 28) -> dict:
+    """实际启动 agy 获取数据(无缓存)。"""
     try:
         agy_path = _resolve_agy()
         master, slave = pty.openpty()
