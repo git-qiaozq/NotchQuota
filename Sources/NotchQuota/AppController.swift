@@ -13,6 +13,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var services: [QuotaService] = []
     private var lastUpdate = Date()
     private var refreshTimer: Timer?
+    private var isRefreshing = false
     private var isOpen = false
     private var closeWorkItem: DispatchWorkItem?   // 延迟收起任务
     private var notchHotRect: NSRect = .zero        // 收起态刘海热区矩形
@@ -231,8 +232,11 @@ final class AppController: NSObject, NSApplicationDelegate {
     }
 
     private func refresh() {
+        guard !isRefreshing else { return }
+        isRefreshing = true
         QuotaFetcher.fetch { [weak self] svcs in
             guard let self = self else { return }
+            self.isRefreshing = false
             self.services = svcs
             self.lastUpdate = Date()
             if self.isOpen { self.panelView.render(svcs, updated: self.lastUpdate) }
