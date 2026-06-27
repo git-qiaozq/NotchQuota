@@ -200,22 +200,29 @@ def _claude_get_token() -> dict:
 
 
 def _claude_refresh_token(refresh_token: str) -> str:
-    """用 refresh_token 静默续期,返回新 access_token(不持久化,仅本次用)。"""
+    """用 refresh_token 静默续期,返回新 access_token。
+    注意:Claude.ai 的 OAuth token endpoint 有 Cloudflare 防护,对脚本请求不友好,
+    且真正的 client_id/endpoint 嵌在 Claude Code 内部。此处为尽力而为的尝试,
+    失败时返回空(由调用方降级为"请运行 claude /login 重新登录")。"""
     import urllib.request, urllib.parse
-    # Claude Code 的 OAuth client(从二进制反编译)
-    data = urllib.parse.urlencode({
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-        "client_id": "9d1c250a-e61b-44d5-8f3a-2e3b5d3c0a46",  # claude-code 客户端
-    }).encode()
-    try:
-        r = urllib.request.urlopen(urllib.request.Request(
-            "https://console.anthropic.com/v1/oauth/token",
-            data=data, method="POST",
-            headers={"content-type": "application/json"}), timeout=15)
-        return json.loads(r.read()).get("access_token", "")
-    except Exception:
-        return ""
+    client_ids = [
+        "9d1c250a-e61b-44d9-88ed-5944d1962f5e",  # Claude Code 客户端(从二进制提取)
+    ]
+    for cid in client_ids:
+        data = urllib.parse.urlencode({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": cid,
+        }).encode()
+        try:
+            r = urllib.request.urlopen(urllib.request.Request(
+                "https://console.anthropic.com/v1/oauth/token",
+                data=data, method="POST",
+                headers={"content-type": "application/json"}), timeout=15)
+            return json.loads(r.read()).get("access_token", "")
+        except Exception:
+            continue
+    return ""
 
 
 _CLAUDE_CACHE = os.path.join(HOME, ".cache", "notchquota_claude.json")
@@ -266,10 +273,13 @@ def _probe_claude_fresh() -> dict:
 
         # token 过期 → 尝试刷新
         expires_at = cred.get("expires_at", 0) / 1000.0 if cred.get("expires_at") else 0
+        refresh_tried = False
         if expires_at and expires_at < _now() and cred.get("refresh"):
+            refresh_tried = True
             new_token = _claude_refresh_token(cred["refresh"])
             if new_token:
                 token = new_token
+                refresh_tried = False  # 刷新成功,不算失败
 
         # 发最小请求
         body = json.dumps({
@@ -288,7 +298,10 @@ def _probe_claude_fresh() -> dict:
             r = urllib.request.urlopen(req, timeout=15)
         except urllib.error.HTTPError as e:
             if e.code == 401:
-                out["detail"] = "token 失效(请运行 claude 重新登录)"
+                if refresh_tried:
+                    out["detail"] = "登录已过期,请运行 claude /login 重新登录"
+                else:
+                    out["detail"] = "token 失效(请运行 claude 重新登录)"
             else:
                 out["detail"] = f"HTTP {e.code}"
             return out

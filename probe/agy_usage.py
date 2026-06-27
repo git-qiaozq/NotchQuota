@@ -283,6 +283,16 @@ class _AgySession:
             if not self.login_selected and 'Select login method:' in txt and 'Google OAuth' in txt:
                 self.login_selected = True
                 self._log("agy is waiting for manual login")
+            # 信任目录确认页(重启后/换工作区首次出现):自动选 Yes
+            if 'trust this folder' in txt or 'trust the contents' in txt:
+                self._log("auto-confirming workspace trust")
+                try:
+                    os.write(self.master, b'\r')   # 默认聚焦 Yes,回车确认
+                except OSError:
+                    pass
+                time.sleep(1.5)
+                self._read_for(0.5)
+                txt = self.buf.decode('utf-8', 'replace')
             if ('AI Pro' in txt or 'Pro (High)' in txt) and time.time() - self.started_at > 5:
                 return True
         return False
