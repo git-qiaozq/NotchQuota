@@ -174,7 +174,129 @@ def probe_antigravity() -> dict:
             })
     return out
 
-# ─────────────────────── Z.AI / GLM ───────────────────────
+# ───────────────────────── Claude ─────────────────────────
+# Claude Pro 用量:用 keychain 里的 OAuth token 发一条 haiku 最小请求,
+# 从响应 header 里提取 ratelimit-unified 字段(5h/7d 窗口 utilization + reset)。
+
+def _claude_get_token() -> dict:
+    """从 keychain 读 Claude Code 的 OAuth 凭证。返回 {token, refresh, expires_at} 或 {}。"""
+    raw = subprocess.run(
+        ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+        capture_output=True, text=True, timeout=8,
+    ).stdout.strip()
+    if not raw:
+        return {}
+    try:
+        cred = json.loads(raw)
+        oauth = cred.get("claudeAiOauth", {})
+        return {
+            "token": oauth.get("accessToken", ""),
+            "refresh": oauth.get("refreshToken", ""),
+            "expires_at": oauth.get("expiresAt", 0),
+            "sub": oauth.get("subscriptionType", ""),
+        }
+    except Exception:
+        return {}
+
+
+def _claude_refresh_token(refresh_token: str) -> str:
+    """用 refresh_token 静默续期,返回新 access_token(不持久化,仅本次用)。"""
+    import urllib.request, urllib.parse
+    # Claude Code 的 OAuth client(从二进制反编译)
+    data = urllib.parse.urlencode({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": "9d1c250a-e61b-44d5-8f3a-2e3b5d3c0a46",  # claude-code 客户端
+    }).encode()
+    try:
+        r = urllib.request.urlopen(urllib.request.Request(
+            "https://console.anthropic.com/v1/oauth/token",
+            data=data, method="POST",
+            headers={"content-type": "application/json"}), timeout=15)
+        return json.loads(r.read()).get("access_token", "")
+    except Exception:
+        return ""
+
+
+def probe_claude() -> dict:
+    """发最小 haiku 请求,从 header 提取 Claude Pro 的 5h/7d 用量。"""
+    out = {
+        "id": "claude", "name": "Claude", "plan": "Claude Pro",
+        "status": "error", "detail": "", "metrics": [],
+        "url": "https://claude.ai/admin-settings/usage",
+    }
+    import urllib.request, urllib.error
+    try:
+        cred = _claude_get_token()
+        token = cred.get("token", "")
+        if not token:
+            out["detail"] = "未找到 Claude 凭证"
+            return out
+
+        # token 过期 → 尝试刷新
+        expires_at = cred.get("expires_at", 0) / 1000.0 if cred.get("expires_at") else 0
+        if expires_at and expires_at < _now() and cred.get("refresh"):
+            new_token = _claude_refresh_token(cred["refresh"])
+            if new_token:
+                token = new_token
+
+        # 发最小请求
+        body = json.dumps({
+            "model": "claude-haiku-4-5",
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "hi"}],
+        }).encode()
+        req = urllib.request.Request("https://api.anthropic.com/v1/messages",
+            data=body, method="POST", headers={
+                "Authorization": f"Bearer {token}",
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+                "anthropic-beta": "oauth-2025-04-20",
+            })
+        try:
+            r = urllib.request.urlopen(req, timeout=15)
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                out["detail"] = "token 失效(请运行 claude 重新登录)"
+            else:
+                out["detail"] = f"HTTP {e.code}"
+            return out
+
+        # 解析 header 里的 ratelimit-unified 字段
+        hdr = r.headers
+        def _util(window):
+            v = hdr.get(f"anthropic-ratelimit-unified-{window}-utilization")
+            return float(v) * 100 if v else None
+        def _reset(window):
+            v = hdr.get(f"anthropic-ratelimit-unified-{window}-reset")
+            return float(v) if v else 0
+
+        metrics = []
+        five_u = _util("5h")
+        if five_u is not None:
+            metrics.append({
+                "label": "5h 窗口",
+                "used_pct": round(five_u, 1),
+                "reset": _human_reset(_reset("5h")),
+            })
+        week_u = _util("7d")
+        if week_u is not None:
+            metrics.append({
+                "label": "周窗口",
+                "used_pct": round(week_u, 1),
+                "reset": _human_reset(_reset("7d")),
+            })
+
+        out["plan"] = f"Claude {cred.get('sub','Pro').capitalize()}" if cred.get("sub") else "Claude Pro"
+        out["metrics"] = metrics
+        out["status"] = "ok"
+        out["detail"] = "实时" if metrics else "无用量 header"
+    except Exception as e:
+        out["detail"] = f"{type(e).__name__}"
+    return out
+
+
+# ─────────────────────── Hermes / Z.AI ───────────────────────
 # Hermes 当前用 Z.AI/GLM 作为 provider,改用其 API key 查 coding plan 真实配额
 # key 从 Hermes .env 读(GLM_API_KEY / ZAI_API_KEY / Z_AI_API_KEY)
 
@@ -251,7 +373,7 @@ def probe_hermes() -> dict:
 
 
 def main():
-    result = [probe_codex(), probe_hermes(), probe_antigravity()]
+    result = [probe_codex(), probe_claude(), probe_hermes(), probe_antigravity()]
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
