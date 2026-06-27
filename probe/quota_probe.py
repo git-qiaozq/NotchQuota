@@ -261,7 +261,7 @@ def _probe_claude_fresh() -> dict:
     out = {
         "id": "claude", "name": "Claude", "plan": "Claude Pro",
         "status": "error", "detail": "", "metrics": [],
-        "url": "https://claude.ai/admin-settings/usage",
+        "url": "https://claude.ai/new#settings/usage",
     }
     import urllib.request, urllib.error
     try:
@@ -376,7 +376,7 @@ def probe_claude() -> dict:
         return {
             "id": "claude", "name": "Claude", "plan": "Claude Pro",
             "status": "error", "detail": f"出口变化,已跳过({last_country}→{cur_country})",
-            "metrics": [], "url": "https://claude.ai/admin-settings/usage",
+            "metrics": [], "url": "https://claude.ai/new#settings/usage",
         }
 
     # 真正发请求
