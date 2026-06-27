@@ -54,9 +54,55 @@ final class AppController: NSObject, NSApplicationDelegate {
         setupHotZone(screen: screen)
         setupPanel(screen: screen)
         refresh()
+        startRefreshTimer()
+        setupActivityGates()
+    }
+
+    private func startRefreshTimer() {
+        refreshTimer?.invalidate()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) {
-            [weak self] _ in self?.refresh()
+            [weak self] _ in self?.refresh(force: false)
         }
+    }
+
+    private func stopRefreshTimer() {
+        refreshTimer?.invalidate()
+        refreshTimer = nil
+    }
+
+    // ── 层2: 活跃度门控 ──
+    // 睡眠/锁屏/显示器睡眠时暂停后台定时器(四家全部不发请求,省电+省风险)
+    // 唤醒/解锁时恢复,并立即刷一次
+    private var isPaused = false
+    private func setupActivityGates() {
+        let ws = NSWorkspace.shared.notificationCenter
+        ws.addObserver(self, selector: #selector(systemSleeping),
+                       name: NSWorkspace.willSleepNotification, object: nil)
+        ws.addObserver(self, selector: #selector(systemWoke),
+                       name: NSWorkspace.didWakeNotification, object: nil)
+        // 屏幕睡眠(锁屏/显示器关)用分布式通知
+        DistributedNotificationCenter.default().addObserver(
+            self, selector: #selector(screenSlept),
+            name: NSNotification.Name("com.apple.screenIsLocked"), object: nil)
+        DistributedNotificationCenter.default().addObserver(
+            self, selector: #selector(screenWoke),
+            name: NSNotification.Name("com.apple.screenIsUnlocked"), object: nil)
+    }
+    @objc private func systemSleeping() { pauseForSleep() }
+    @objc private func systemWoke() { resumeFromSleep() }
+    @objc private func screenSlept() { pauseForSleep() }
+    @objc private func screenWoke() { resumeFromSleep() }
+
+    private func pauseForSleep() {
+        guard !isPaused else { return }
+        isPaused = true
+        stopRefreshTimer()
+    }
+    private func resumeFromSleep() {
+        guard isPaused else { return }
+        isPaused = false
+        startRefreshTimer()
+        refresh(force: true)   // 唤醒后立即取一次实时数据
     }
 
     // ── 再次点击 app 图标(运行中) → 弹出设置窗口 ──
@@ -159,6 +205,8 @@ final class AppController: NSObject, NSApplicationDelegate {
         let g = notchGeom(screen)
 
         panelView.render(services, updated: lastUpdate)
+        // 展开面板时按需强制刷新(层1的"按需"部分):Claude 会跳过缓存取实时
+        refresh(force: true)
         // fittingSize 已含 notchInset → 总高度 = 刘海融合区 + 内容
         let totalH = panelView.fittingSize.height
         // 目标:顶部超出屏幕顶 2pt,刚好盖住那条 1px 边线,不浪费可视空间
@@ -237,10 +285,10 @@ final class AppController: NSObject, NSApplicationDelegate {
         closeWorkItem?.cancel(); closeWorkItem = nil
     }
 
-    private func refresh() {
+    private func refresh(force: Bool = false) {
         guard !isRefreshing else { return }
         isRefreshing = true
-        QuotaFetcher.fetch { [weak self] svcs in
+        QuotaFetcher.fetch(force: force) { [weak self] svcs in
             guard let self = self else { return }
             self.isRefreshing = false
             self.services = svcs

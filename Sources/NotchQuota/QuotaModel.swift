@@ -35,14 +35,25 @@ enum QuotaFetcher {
     }
 
     static func fetch(completion: @escaping ([QuotaService]) -> Void) {
+        fetch(force: false, completion: completion)
+    }
+
+    /// force=true 时(如展开面板),让 probe 跳过 Claude 的缓存,取实时数据
+    static func fetch(force: Bool, completion: @escaping ([QuotaService]) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = runProbe()
+            let result = runProbe(force: force)
             DispatchQueue.main.async { completion(result) }
         }
     }
 
-    private static func runProbe() -> [QuotaService] {
+    private static func runProbe(force: Bool) -> [QuotaService] {
         let proc = makeProcess(args: [probePath])
+        // force 刷新时注入环境变量,probe 据此跳过 Claude 缓存(层1降频的"按需"部分)
+        if force {
+            var env = proc.environment ?? [:]
+            env["NOTCHQUOTA_FORCE"] = "1"
+            proc.environment = env
+        }
         let pipe = Pipe()
         proc.standardOutput = pipe
         proc.standardError = Pipe()

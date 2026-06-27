@@ -218,8 +218,39 @@ def _claude_refresh_token(refresh_token: str) -> str:
         return ""
 
 
-def probe_claude() -> dict:
-    """发最小 haiku 请求,从 header 提取 Claude Pro 的 5h/7d 用量。"""
+_CLAUDE_CACHE = os.path.join(HOME, ".cache", "notchquota_claude.json")
+_CLAUDE_TTL = 900  # 15 分钟:降频防封号(层1)
+_CLAUDE_LAST_COUNTRY_FILE = os.path.join(HOME, ".cache", "notchquota_claude_country")
+
+
+def _claude_get_country() -> str:
+    """查当前出口 IP 所在国家(轻量,~0.3s)。失败返回空。"""
+    import urllib.request
+    try:
+        r = urllib.request.urlopen(
+            "http://ip-api.com/json/?fields=countryCode", timeout=4)
+        return json.loads(r.read()).get("countryCode", "")
+    except Exception:
+        return ""
+
+
+def _claude_last_country() -> str:
+    try:
+        return open(_CLAUDE_LAST_COUNTRY_FILE).read().strip()
+    except Exception:
+        return ""
+
+
+def _claude_save_country(c: str) -> None:
+    try:
+        os.makedirs(os.path.dirname(_CLAUDE_LAST_COUNTRY_FILE), exist_ok=True)
+        open(_CLAUDE_LAST_COUNTRY_FILE, "w").write(c)
+    except Exception:
+        pass
+
+
+def _probe_claude_fresh() -> dict:
+    """实际发请求取 Claude 用量(无门控)。"""
     out = {
         "id": "claude", "name": "Claude", "plan": "Claude Pro",
         "status": "error", "detail": "", "metrics": [],
@@ -294,6 +325,59 @@ def probe_claude() -> dict:
     except Exception as e:
         out["detail"] = f"{type(e).__name__}"
     return out
+
+
+def probe_claude() -> dict:
+    """Claude Pro 用量,带封号风险防护:
+    - 层1: 15分钟缓存(后台定时器即便每分钟跑,Claude 也最多15分钟真发一次)
+    - 层3: 出口国家漂移检测(Clash切节点换国家 → 跳过本轮,避免短时间跨国)
+    强制刷新(展开面板)时跳过层1缓存,但层3漂移检测仍生效。"""
+    forced = os.environ.get("NOTCHQUOTA_FORCE") == "1"
+
+    # 层1: 缓存(非强制刷新时)
+    if not forced:
+        try:
+            if os.path.exists(_CLAUDE_CACHE):
+                age = _now() - os.path.getmtime(_CLAUDE_CACHE)
+                if age < _CLAUDE_TTL:
+                    d = json.load(open(_CLAUDE_CACHE))
+                    if d.get("status") == "ok":
+                        d["detail"] = f"缓存{int(age/60)}m"
+                        return d
+        except Exception:
+            pass
+
+    # 层3: 出口漂移检测 — 国家变化则跳过,返回上次缓存
+    cur_country = _claude_get_country()
+    last_country = _claude_last_country()
+    if cur_country and last_country and cur_country != last_country:
+        # 出口漂移:返回缓存(如果有),否则报状态,绝不发请求
+        try:
+            if os.path.exists(_CLAUDE_CACHE):
+                d = json.load(open(_CLAUDE_CACHE))
+                if d.get("status") == "ok":
+                    d["detail"] = f"出口变化({last_country}→{cur_country}),已跳过"
+                    return d
+        except Exception:
+            pass
+        return {
+            "id": "claude", "name": "Claude", "plan": "Claude Pro",
+            "status": "error", "detail": f"出口变化,已跳过({last_country}→{cur_country})",
+            "metrics": [], "url": "https://claude.ai/admin-settings/usage",
+        }
+
+    # 真正发请求
+    result = _probe_claude_fresh()
+    # 记录本次出口国家(仅成功时更新,避免临时网络抖动污染基线)
+    if result.get("status") == "ok" and cur_country:
+        _claude_save_country(cur_country)
+        # 写缓存(供层1 和层3 跳过时返回)
+        try:
+            os.makedirs(os.path.dirname(_CLAUDE_CACHE), exist_ok=True)
+            json.dump(result, open(_CLAUDE_CACHE, "w"), ensure_ascii=False)
+        except Exception:
+            pass
+    return result
 
 
 # ─────────────────────── Hermes / Z.AI ───────────────────────
