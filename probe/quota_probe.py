@@ -34,9 +34,40 @@ def _human_reset(epoch: float) -> str:
 
 
 # ───────────────────────── Codex ─────────────────────────
-def probe_codex() -> dict:
-    """调 ChatGPT wham/usage API 取实时用量(5h主窗口 + 周窗口)。
-    凭证从 ~/.codex/auth.json 读取(Codex CLI 自己维护刷新)。"""
+_CODEX_CACHE = os.path.join(HOME, ".cache", "notchquota_codex.json")
+_CODEX_TTL = 300          # 层1: 轻缓存 5 分钟(用量变化不快,减少撞墙频率)
+_CODEX_FAIL_FILE = os.path.join(HOME, ".cache", "notchquota_codex_fails")
+_CODEX_FAIL_THRESHOLD = 2 # 连续失败 2 次后进入退避
+_CODEX_BACKOFF_TTL = 300  # 退避期间最多 5 分钟试一次(不每分钟撞墙)
+
+
+def _codex_fail_count() -> int:
+    try:
+        return int(open(_CODEX_FAIL_FILE).read().strip() or "0")
+    except Exception:
+        return 0
+
+
+def _codex_record_fail():
+    try:
+        os.makedirs(os.path.dirname(_CODEX_FAIL_FILE), exist_ok=True)
+        n = _codex_fail_count() + 1
+        open(_CODEX_FAIL_FILE, "w").write(str(n))
+    except Exception:
+        pass
+
+
+def _codex_reset_fails():
+    try:
+        os.remove(_CODEX_FAIL_FILE)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
+def _probe_codex_fresh() -> dict:
+    """实际调 wham/usage API 取 Codex 实时用量(无门控)。"""
     out = {
         "id": "codex", "name": "Codex", "plan": "ChatGPT Plan",
         "status": "error", "detail": "", "metrics": [],
@@ -98,6 +129,62 @@ def probe_codex() -> dict:
     except Exception as e:
         out["detail"] = f"{type(e).__name__}"
     return out
+
+
+def probe_codex() -> dict:
+    """Codex 用量,带 soft-block 防护:
+    - 层1 轻缓存: 5 分钟(用量变化不快,减少撞墙频率)
+    - 层2 失败退避: 连续失败 2 次后,5 分钟才试一次(不每分钟撞墙);
+      成功立刻清零恢复正常。
+    强制刷新(展开面板)时跳过缓存,但退避仍生效(避免手动触发也撞墙)。"""
+    forced = os.environ.get("NOTCHQUOTA_FORCE") == "1"
+    fails = _codex_fail_count()
+
+    # 层2: 退避中 — 除非强制刷新且过了退避间隔,否则直接返回缓存/降级状态
+    in_backoff = fails >= _CODEX_FAIL_THRESHOLD
+    if in_backoff and not forced:
+        # 退避期:返回缓存(如有),否则显式提示节点问题
+        try:
+            if os.path.exists(_CODEX_CACHE):
+                age = _now() - os.path.getmtime(_CODEX_CACHE)
+                if age < _CODEX_BACKOFF_TTL:
+                    d = json.load(open(_CODEX_CACHE))
+                    if d.get("status") == "ok":
+                        d["detail"] = f"节点不通,已降频(连续失败{fails}次)"
+                        return d
+        except Exception:
+            pass
+        return {
+            "id": "codex", "name": "Codex", "plan": "ChatGPT Plan",
+            "status": "error", "detail": f"节点不通,已降频(连续失败{fails}次)",
+            "metrics": [], "url": "https://chatgpt.com/codex/cloud/settings/analytics",
+        }
+
+    # 层1: 轻缓存(非强制刷新时)
+    if not forced:
+        try:
+            if os.path.exists(_CODEX_CACHE):
+                age = _now() - os.path.getmtime(_CODEX_CACHE)
+                if age < _CODEX_TTL:
+                    d = json.load(open(_CODEX_CACHE))
+                    if d.get("status") == "ok":
+                        d["detail"] = f"缓存{int(age/60)}m"
+                        return d
+        except Exception:
+            pass
+
+    # 真正发请求
+    result = _probe_codex_fresh()
+    if result.get("status") == "ok":
+        _codex_reset_fails()    # 成功 → 清零,恢复正常频率
+        try:
+            os.makedirs(os.path.dirname(_CODEX_CACHE), exist_ok=True)
+            json.dump(result, open(_CODEX_CACHE, "w"), ensure_ascii=False)
+        except Exception:
+            pass
+    else:
+        _codex_record_fail()     # 失败 → 计数,触发退避
+    return result
 
 
 # ───────────────────── Antigravity ─────────────────────
