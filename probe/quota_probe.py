@@ -140,23 +140,22 @@ def probe_codex() -> dict:
     forced = os.environ.get("NOTCHQUOTA_FORCE") == "1"
     fails = _codex_fail_count()
 
-    # 层2: 退避中 — 除非强制刷新且过了退避间隔,否则直接返回缓存/降级状态
+    # 层2: 退避中 — 优先返回上次成功缓存(保持 UI 不被打断),只有完全没有缓存时才显示橙色提示
     in_backoff = fails >= _CODEX_FAIL_THRESHOLD
     if in_backoff and not forced:
-        # 退避期:返回缓存(如有),否则显式提示节点问题
         try:
             if os.path.exists(_CODEX_CACHE):
-                age = _now() - os.path.getmtime(_CODEX_CACHE)
-                if age < _CODEX_BACKOFF_TTL:
-                    d = json.load(open(_CODEX_CACHE))
-                    if d.get("status") == "ok":
-                        d["detail"] = f"节点不通,已降频(连续失败{fails}次)"
-                        return d
+                d = json.load(open(_CODEX_CACHE))
+                if d.get("status") == "ok":
+                    # 有缓存 → 返回上次结果,只改 detail 提示来源,UI 保持绿色卡片
+                    d["detail"] = f"节点不通,显示上次结果"
+                    return d
         except Exception:
             pass
+        # 没有缓存(首次就失败)→ 只能显示橙色提示
         return {
             "id": "codex", "name": "Codex", "plan": "ChatGPT Plan",
-            "status": "error", "detail": f"节点不通,已降频(连续失败{fails}次)",
+            "status": "error", "detail": f"节点不通(已降频)",
             "metrics": [], "url": "https://chatgpt.com/codex/cloud/settings/analytics",
         }
 
