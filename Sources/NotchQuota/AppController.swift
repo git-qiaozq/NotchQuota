@@ -53,6 +53,12 @@ final class AppController: NSObject, NSApplicationDelegate {
         guard let screen = NSScreen.main else { return }
         setupHotZone(screen: screen)
         setupPanel(screen: screen)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(cardVisibilityChanged),
+            name: .quotaCardVisibilityDidChange,
+            object: nil
+        )
         refresh()
         startRefreshTimer()
         setupActivityGates()
@@ -120,6 +126,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     // ── app 退出时优雅关闭 agy daemon,避免遗留孤儿进程 ──
     // daemon 收到 shutdown 会终止它托管的 agy 会话并清理 socket
     func applicationWillTerminate(_ notification: Notification) {
+        NotificationCenter.default.removeObserver(self)
         QuotaFetcher.shutdownDaemon()
     }
 
@@ -204,7 +211,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         let sf = screen.frame
         let g = notchGeom(screen)
 
-        panelView.render(services, updated: lastUpdate)
+        renderPanel()
         // 展开面板时按需强制刷新(层1的"按需"部分):Claude 会跳过缓存取实时
         refresh(force: true)
         // fittingSize 已含 notchInset → 总高度 = 刘海融合区 + 内容
@@ -293,8 +300,30 @@ final class AppController: NSObject, NSApplicationDelegate {
             self.isRefreshing = false
             self.services = svcs
             self.lastUpdate = Date()
-            if self.isOpen { self.panelView.render(svcs, updated: self.lastUpdate) }
+            if self.isOpen { self.renderPanel(updateFrame: true) }
         }
+    }
+
+    @objc private func cardVisibilityChanged() {
+        guard isOpen else { return }
+        renderPanel(updateFrame: true)
+    }
+
+    private func renderPanel(updateFrame: Bool = false) {
+        let visible = QuotaDisplayPreferences.visibleServices(from: services)
+        let emptyMessage = services.isEmpty
+            ? "无法读取数据（probe 脚本未返回）"
+            : "没有可显示的卡片"
+        panelView.render(visible, updated: lastUpdate, emptyMessage: emptyMessage)
+
+        guard updateFrame, isOpen, let target = currentTargetFrame else { return }
+        let newHeight = panelView.fittingSize.height
+        let newFrame = NSRect(x: target.origin.x,
+                              y: target.maxY - newHeight,
+                              width: target.width,
+                              height: newHeight)
+        currentTargetFrame = newFrame
+        panelWindow.setFrame(newFrame, display: true, animate: true)
     }
 
     private func openURL(_ s: String) {

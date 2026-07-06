@@ -33,7 +33,7 @@ final class PanelView: NSView {
     }
     required init?(coder: NSCoder) { fatalError() }
 
-    func render(_ services: [QuotaService], updated: Date) {
+    func render(_ services: [QuotaService], updated: Date, emptyMessage: String = "无法读取数据（probe 脚本未返回）") {
         stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
 
         let title = NSTextField(labelWithString: "套餐用量")
@@ -42,9 +42,9 @@ final class PanelView: NSView {
         stack.addArrangedSubview(title)
 
         if services.isEmpty {
-            let err = NSTextField(labelWithString: "⚠️ 无法读取数据（probe 脚本未返回）")
+            let err = NSTextField(labelWithString: emptyMessage)
             err.font = .systemFont(ofSize: 12)
-            err.textColor = .systemOrange
+            err.textColor = .secondaryLabelColor
             stack.addArrangedSubview(err)
         } else {
             for svc in services {
