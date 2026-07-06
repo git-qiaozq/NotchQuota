@@ -327,6 +327,36 @@ class _AgySession:
                 return reason
         return None
 
+    def _request_usage_once(self, wait_seconds: float = 9):
+        marker = f"__NOTCHQUOTA_USAGE_{int(time.time() * 1000)}__"
+        self.buf += f"\n{marker}\n".encode()
+        os.write(self.master, b'\x1b')
+        time.sleep(0.15)
+        os.write(self.master, b'\x15')
+        time.sleep(0.05)
+        for ch in '/usage':
+            os.write(self.master, ch.encode())
+            time.sleep(0.03)
+        os.write(self.master, b'\r')
+        self.sent_once = True
+
+        deadline = time.time() + wait_seconds
+        groups = []
+        text = ''
+        while time.time() < deadline:
+            self._read_for(0.3)
+            text = _clean(self.buf.decode('utf-8', 'replace'))
+            recent = text.split(marker, 1)[-1]
+            groups = _parse_usage(recent)
+            if groups and time.time() < deadline - 1:
+                # 多等一小会儿让 TUI 刷新完整,然后取最后一次绘制
+                self._read_for(1.0)
+                text = _clean(self.buf.decode('utf-8', 'replace'))
+                recent = text.split(marker, 1)[-1]
+                groups = _parse_usage(recent)
+                break
+        return groups, text
+
     def fetch_usage(self, timeout_total: int = 28) -> dict:
         with self.lock:
             try:
@@ -347,33 +377,12 @@ class _AgySession:
                         return auth_waiting
                     return {'status': 'error', 'detail': 'agy 未就绪', 'raw': text[-800:] if text else ''}
 
-                marker = f"__NOTCHQUOTA_USAGE_{int(time.time() * 1000)}__"
-                self.buf += f"\n{marker}\n".encode()
-                os.write(self.master, b'\x1b')
-                time.sleep(0.15)
-                os.write(self.master, b'\x15')
-                time.sleep(0.05)
-                for ch in '/usage':
-                    os.write(self.master, ch.encode())
-                    time.sleep(0.03)
-                os.write(self.master, b'\r')
-                self.sent_once = True
-
-                deadline = time.time() + 9
-                groups = []
-                text = ''
-                while time.time() < deadline:
-                    self._read_for(0.3)
-                    text = _clean(self.buf.decode('utf-8', 'replace'))
-                    recent = text.split(marker, 1)[-1]
-                    groups = _parse_usage(recent)
-                    if groups and time.time() < deadline - 1:
-                        # 多等一小会儿让 TUI 刷新完整,然后取最后一次绘制
-                        self._read_for(1.0)
-                        text = _clean(self.buf.decode('utf-8', 'replace'))
-                        recent = text.split(marker, 1)[-1]
-                        groups = _parse_usage(recent)
-                        break
+                groups, text = self._request_usage_once(wait_seconds=10)
+                if not groups and 'Loading quota summary' in text:
+                    self._log("usage stayed loading; restarting agy and retrying")
+                    self._start()
+                    if self._wait_ready(12):
+                        groups, text = self._request_usage_once(wait_seconds=12)
                 if groups:
                     return {'status': 'ok', 'detail': '实时(agy daemon)', 'groups': groups}
                 return {'status': 'error', 'detail': '解析失败', 'raw': text[-800:] if text else '(无输出)'}
@@ -517,7 +526,7 @@ def fetch_usage(timeout_total: int = 28) -> dict:
     if ready.get("status") != "ok":
         return ready
     try:
-        return _daemon_request("usage", timeout_total + 5)
+        return _daemon_request("usage", timeout_total + 15)
     except Exception as e:
         return {'status': 'error', 'detail': f'daemon 请求失败: {type(e).__name__}: {e}'}
 
