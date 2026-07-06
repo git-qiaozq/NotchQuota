@@ -8,7 +8,6 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     static let shared = SettingsWindowController()
     private var window: NSWindow?
     private var launchSwitch: NSSwitch?
-    private var cardSwitches: [String: NSSwitch] = [:]
 
     func show() {
         if let w = window {
@@ -127,28 +126,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         visibleHint.frame.origin = NSPoint(x: 16, y: visibleH - 45)
         visibleCard.addSubview(visibleHint)
 
-        cardSwitches.removeAll()
-        let rowStartY: CGFloat = visibleH - 76
-        for (index, option) in QuotaDisplayPreferences.knownCards.enumerated() {
-            let rowY = rowStartY - CGFloat(index) * 30
-            let label = NSTextField(labelWithString: option.name)
-            label.font = .systemFont(ofSize: 14, weight: .medium)
-            label.textColor = .white
-            label.sizeToFit()
-            label.frame.origin = NSPoint(x: 16, y: rowY)
-
-            let rowSwitch = NSSwitch()
-            rowSwitch.identifier = NSUserInterfaceItemIdentifier(option.id)
-            rowSwitch.target = self
-            rowSwitch.action = #selector(toggleCardVisibility(_:))
-            rowSwitch.state = QuotaDisplayPreferences.isCardVisible(id: option.id) ? .on : .off
-            rowSwitch.sizeToFit()
-            rowSwitch.frame.origin = NSPoint(x: cardW - rowSwitch.frame.width - 16,
-                                             y: rowY - 3)
-            cardSwitches[option.id] = rowSwitch
-            visibleCard.addSubview(label)
-            visibleCard.addSubview(rowSwitch)
-        }
+        let cardList = CardOrderListView(frame: NSRect(x: 12, y: 12, width: cardW - 24, height: 122))
+        visibleCard.addSubview(cardList)
 
         // ── 退出卡片 ──
         let quitH: CGFloat = 96
@@ -209,11 +188,6 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         }
     }
 
-    @objc private func toggleCardVisibility(_ sender: NSSwitch) {
-        guard let id = sender.identifier?.rawValue else { return }
-        QuotaDisplayPreferences.setCardVisible(id: id, visible: sender.state == .on)
-    }
-
     @objc private func quitApp() {
         window?.close()
         NSApp.terminate(nil)
@@ -222,7 +196,190 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         window = nil
         launchSwitch = nil
-        cardSwitches.removeAll()
+    }
+}
+
+final class CardOrderListView: NSView {
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    private let rowHeight: CGFloat = 28
+    private let rowGap: CGFloat = 3
+    private var cards = QuotaDisplayPreferences.orderedCards
+    private var rows: [CardOrderRowView] = []
+    private weak var draggingRow: CardOrderRowView?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+        rebuildRows()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        rebuildRows()
+    }
+
+    private func rebuildRows() {
+        subviews.forEach { $0.removeFromSuperview() }
+        rows = cards.map { option in
+            let row = CardOrderRowView(option: option)
+            row.onToggleVisibility = { id, isVisible in
+                QuotaDisplayPreferences.setCardVisible(id: id, visible: isVisible)
+            }
+            row.onDragStart = { [weak self] row, event in self?.startDragging(row, event: event) }
+            row.onDragMove = { [weak self] row, event in self?.drag(row, event: event) }
+            row.onDragEnd = { [weak self] row in self?.endDragging(row) }
+            addSubview(row)
+            return row
+        }
+        layoutRows(animated: false)
+    }
+
+    private func frameForRow(at index: Int) -> NSRect {
+        let y = bounds.height - rowHeight - CGFloat(index) * (rowHeight + rowGap)
+        return NSRect(x: 0, y: y, width: bounds.width, height: rowHeight)
+    }
+
+    private func layoutRows(animated: Bool, excluding excludedRow: CardOrderRowView? = nil) {
+        for (index, row) in rows.enumerated() where row !== excludedRow {
+            let frame = frameForRow(at: index)
+            if animated {
+                NSAnimationContext.runAnimationGroup { context in
+                    context.duration = 0.14
+                    context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                    row.animator().frame = frame
+                }
+            } else {
+                row.frame = frame
+            }
+        }
+    }
+
+    private func startDragging(_ row: CardOrderRowView, event: NSEvent) {
+        draggingRow = row
+        addSubview(row, positioned: .above, relativeTo: nil)
+        row.setDragging(true)
+    }
+
+    private func drag(_ row: CardOrderRowView, event: NSEvent) {
+        guard draggingRow === row,
+              let currentIndex = rows.firstIndex(where: { $0 === row }) else { return }
+
+        let location = convert(event.locationInWindow, from: nil)
+        let newY = min(max(location.y - rowHeight / 2, 0), bounds.height - rowHeight)
+        row.frame.origin.y = newY
+
+        let proposedIndex = min(
+            max(Int((bounds.height - location.y) / (rowHeight + rowGap)), 0),
+            rows.count - 1
+        )
+        guard proposedIndex != currentIndex else { return }
+
+        let movedRow = rows.remove(at: currentIndex)
+        rows.insert(movedRow, at: proposedIndex)
+        let movedCard = cards.remove(at: currentIndex)
+        cards.insert(movedCard, at: proposedIndex)
+        QuotaDisplayPreferences.setCardOrder(cards)
+        layoutRows(animated: true, excluding: row)
+    }
+
+    private func endDragging(_ row: CardOrderRowView) {
+        guard draggingRow === row else { return }
+        draggingRow = nil
+        row.setDragging(false)
+        layoutRows(animated: true)
+    }
+}
+
+final class CardOrderRowView: NSView {
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    let option: QuotaCardOption
+    var onToggleVisibility: ((String, Bool) -> Void)?
+    var onDragStart: ((CardOrderRowView, NSEvent) -> Void)?
+    var onDragMove: ((CardOrderRowView, NSEvent) -> Void)?
+    var onDragEnd: ((CardOrderRowView) -> Void)?
+
+    private let grip = NSTextField(labelWithString: "☰")
+    private let nameLabel: NSTextField
+    private let visibilitySwitch = NSSwitch()
+
+    init(option: QuotaCardOption) {
+        self.option = option
+        self.nameLabel = NSTextField(labelWithString: option.name)
+        super.init(frame: .zero)
+        configure()
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    private func configure() {
+        wantsLayer = true
+        layer?.backgroundColor = NSColor(white: 1, alpha: 0.045).cgColor
+        layer?.cornerRadius = 7
+
+        grip.font = .systemFont(ofSize: 12, weight: .semibold)
+        grip.textColor = NSColor(white: 0.46, alpha: 1)
+        grip.alignment = .center
+        addSubview(grip)
+
+        nameLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        nameLabel.textColor = .white
+        addSubview(nameLabel)
+
+        visibilitySwitch.target = self
+        visibilitySwitch.action = #selector(toggleVisibility)
+        visibilitySwitch.state = QuotaDisplayPreferences.isCardVisible(id: option.id) ? .on : .off
+        addSubview(visibilitySwitch)
+    }
+
+    override func layout() {
+        super.layout()
+        grip.frame = NSRect(x: 8, y: 5, width: 18, height: bounds.height - 10)
+        nameLabel.sizeToFit()
+        nameLabel.frame.origin = NSPoint(x: 32, y: (bounds.height - nameLabel.frame.height) / 2)
+        visibilitySwitch.sizeToFit()
+        visibilitySwitch.frame.origin = NSPoint(x: bounds.width - visibilitySwitch.frame.width - 10,
+                                                y: (bounds.height - visibilitySwitch.frame.height) / 2)
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .openHand)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        NSCursor.closedHand.set()
+        onDragStart?(self, event)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        onDragMove?(self, event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        NSCursor.openHand.set()
+        onDragEnd?(self)
+    }
+
+    func setDragging(_ isDragging: Bool) {
+        let scale: CGFloat = isDragging ? 1.03 : 1
+        let bg = isDragging
+            ? NSColor(white: 1, alpha: 0.11)
+            : NSColor(white: 1, alpha: 0.045)
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(0.12)
+        layer?.backgroundColor = bg.cgColor
+        layer?.shadowColor = NSColor.black.cgColor
+        layer?.shadowOpacity = isDragging ? 0.28 : 0
+        layer?.shadowRadius = isDragging ? 8 : 0
+        layer?.shadowOffset = NSSize(width: 0, height: -3)
+        layer?.transform = CATransform3DMakeScale(scale, scale, 1)
+        CATransaction.commit()
+    }
+
+    @objc private func toggleVisibility() {
+        onToggleVisibility?(option.id, visibilitySwitch.state == .on)
     }
 }
 
