@@ -39,6 +39,7 @@ _CODEX_TTL = 300          # 层1: 轻缓存 5 分钟(用量变化不快,减少�
 _CODEX_FAIL_FILE = os.path.join(HOME, ".cache", "notchquota_codex_fails")
 _CODEX_FAIL_THRESHOLD = 2 # 连续失败 2 次后进入退避
 _CODEX_BACKOFF_TTL = 300  # 退避期间最多 5 分钟试一次(不每分钟撞墙)
+_CODEX_LOG = os.path.join(HOME, ".cache", "notchquota_codex.log")
 
 
 def _codex_fail_count() -> int:
@@ -64,6 +65,27 @@ def _codex_reset_fails():
         pass
     except Exception:
         pass
+
+
+def _codex_log(msg: str) -> None:
+    try:
+        os.makedirs(os.path.dirname(_CODEX_LOG), exist_ok=True)
+        with open(_CODEX_LOG, "a") as f:
+            f.write(f"{datetime.now().isoformat(timespec='seconds')} {msg}\n")
+    except Exception:
+        pass
+
+
+def _codex_cached_result(detail: str) -> dict | None:
+    try:
+        if os.path.exists(_CODEX_CACHE):
+            d = json.load(open(_CODEX_CACHE))
+            if d.get("status") == "ok":
+                d["detail"] = detail
+                return d
+    except Exception:
+        pass
+    return None
 
 
 def _probe_codex_fresh() -> dict:
@@ -105,6 +127,12 @@ def _probe_codex_fresh() -> dict:
             else:
                 out["detail"] = f"HTTP {e.code}"
             return out
+        except urllib.error.URLError as e:
+            reason = getattr(e, "reason", e)
+            out["detail"] = "网络波动"
+            out["transient"] = True
+            _codex_log(f"URLError: {reason}")
+            return out
 
         rl = data.get("rate_limit", {})
         plan = data.get("plan_type", "")
@@ -143,15 +171,9 @@ def probe_codex() -> dict:
     # 层2: 退避中 — 优先返回上次成功缓存(保持 UI 不被打断),只有完全没有缓存时才显示橙色提示
     in_backoff = fails >= _CODEX_FAIL_THRESHOLD
     if in_backoff and not forced:
-        try:
-            if os.path.exists(_CODEX_CACHE):
-                d = json.load(open(_CODEX_CACHE))
-                if d.get("status") == "ok":
-                    # 有缓存 → 返回上次结果,只改 detail 提示来源,UI 保持绿色卡片
-                    d["detail"] = f"节点不通,显示上次结果"
-                    return d
-        except Exception:
-            pass
+        cached = _codex_cached_result("节点不通,显示上次结果")
+        if cached:
+            return cached
         # 没有缓存(首次就失败)→ 只能显示橙色提示
         return {
             "id": "codex", "name": "Codex", "plan": "ChatGPT Plan",
@@ -181,6 +203,11 @@ def probe_codex() -> dict:
             json.dump(result, open(_CODEX_CACHE, "w"), ensure_ascii=False)
         except Exception:
             pass
+    elif result.get("transient"):
+        _codex_record_fail()
+        cached = _codex_cached_result("网络波动,显示上次结果")
+        if cached:
+            return cached
     else:
         _codex_record_fail()     # 失败 → 计数,触发退避
     return result
