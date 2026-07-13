@@ -88,6 +88,79 @@ def _codex_cached_result(detail: str) -> dict | None:
     return None
 
 
+def _codex_metrics_by_label(result: dict) -> dict[str, dict]:
+    return {
+        metric.get("label", ""): metric
+        for metric in result.get("metrics", [])
+        if isinstance(metric, dict)
+    }
+
+
+def _codex_all_windows_zero(result: dict) -> bool:
+    """只把两个窗口同时为 0 视为可疑，单窗口归零可能是正常重置。"""
+    metrics = _codex_metrics_by_label(result)
+    windows = [metrics.get("5h 窗口"), metrics.get("周窗口")]
+    return all(metric is not None and metric.get("used_pct") == 0 for metric in windows)
+
+
+def _codex_has_usage(result: dict) -> bool:
+    return any(
+        isinstance(metric, dict) and (metric.get("used_pct") or 0) > 0
+        for metric in result.get("metrics", [])
+    )
+
+
+def _codex_same_reset_cycle(current: dict, cached: dict) -> bool:
+    """只有重置时间戳一致时才用旧值兜底，避免掩盖真实的新周期归零。"""
+    current_metrics = _codex_metrics_by_label(current)
+    cached_metrics = _codex_metrics_by_label(cached)
+    for label in ("5h 窗口", "周窗口"):
+        current_reset = current_metrics.get(label, {}).get("reset_at")
+        cached_reset = cached_metrics.get(label, {}).get("reset_at")
+        if not current_reset or current_reset != cached_reset:
+            return False
+    return True
+
+
+def _codex_window_label(window: dict, fallback: str) -> str:
+    """按窗口时长识别 5h/周额度；primary/secondary 的含义会随套餐变化。"""
+    seconds = window.get("limit_window_seconds") or 0
+    try:
+        seconds = int(seconds)
+    except (TypeError, ValueError):
+        seconds = 0
+    if 4 * 3600 <= seconds <= 6 * 3600:
+        return "5h 窗口"
+    if 6 * 24 * 3600 <= seconds <= 8 * 24 * 3600:
+        return "周窗口"
+    return fallback
+
+
+def _codex_metrics_from_rate_limit(rate_limit: dict) -> list[dict]:
+    """把 wham 的窗口转换为 UI 指标，并保持 5h 在前、周窗口在后。"""
+    metrics_by_label = {}
+    for key, fallback in (
+        ("primary_window", "5h 窗口"),
+        ("secondary_window", "周窗口"),
+    ):
+        window = rate_limit.get(key) or {}
+        if not window:
+            continue
+        label = _codex_window_label(window, fallback)
+        metrics_by_label[label] = {
+            "label": label,
+            "used_pct": round(window.get("used_percent", 0), 1),
+            "reset": _human_reset(window.get("reset_at", 0)),
+            # 仅供本地缓存判断是否仍是同一统计周期；AppKit 解码会忽略此字段。
+            "reset_at": window.get("reset_at", 0),
+        }
+    return [
+        metrics_by_label[label]
+        for label in ("5h 窗口", "周窗口")
+        if label in metrics_by_label
+    ]
+
+
 def _probe_codex_fresh() -> dict:
     """实际调 wham/usage API 取 Codex 实时用量(无门控)。"""
     out = {
@@ -138,20 +211,7 @@ def _probe_codex_fresh() -> dict:
         plan = data.get("plan_type", "")
         out["plan"] = f"ChatGPT {plan.capitalize()}" if plan else "ChatGPT Plan"
 
-        metrics = []
-        prim = rl.get("primary_window") or {}
-        sec = rl.get("secondary_window") or {}
-        if prim:
-            metrics.append({
-                "label": "5h 窗口", "used_pct": round(prim.get("used_percent", 0), 1),
-                "reset": _human_reset(prim.get("reset_at", 0)),
-            })
-        if sec:
-            metrics.append({
-                "label": "周窗口", "used_pct": round(sec.get("used_percent", 0), 1),
-                "reset": _human_reset(sec.get("reset_at", 0)),
-            })
-        out["metrics"] = metrics
+        out["metrics"] = _codex_metrics_from_rate_limit(rl)
         out["status"] = "ok"
         out["detail"] = "实时"
     except Exception as e:
@@ -197,6 +257,26 @@ def probe_codex() -> dict:
     # 真正发请求
     result = _probe_codex_fresh()
     if result.get("status") == "ok":
+        if _codex_all_windows_zero(result):
+            # wham/usage 偶尔会在同一统计周期内暂时返回全 0，先给后端一次短暂同步机会。
+            _codex_log("all-zero usage response; retrying once")
+            time.sleep(1)
+            retried = _probe_codex_fresh()
+            if retried.get("status") == "ok":
+                result = retried
+                if _codex_has_usage(result):
+                    _codex_log("all-zero usage response recovered on retry")
+            else:
+                _codex_log(f"all-zero usage retry failed: {retried.get('detail', 'unknown')}")
+
+            # 两次都是 0 且重置时间未变化，说明不是新周期：保留上一份可信结果，且不污染缓存。
+            if _codex_all_windows_zero(result):
+                cached = _codex_cached_result("统计同步中,显示上次结果")
+                if cached and _codex_has_usage(cached) and _codex_same_reset_cycle(result, cached):
+                    _codex_log("all-zero usage response kept cached result from same reset cycle")
+                    _codex_reset_fails()
+                    return cached
+
         _codex_reset_fails()    # 成功 → 清零,恢复正常频率
         try:
             os.makedirs(os.path.dirname(_CODEX_CACHE), exist_ok=True)
