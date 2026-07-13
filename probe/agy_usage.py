@@ -189,6 +189,15 @@ _LOCK_PATH = os.path.join(_RUNTIME_DIR, "agy_daemon.lock")
 _DAEMON_LOCK_PATH = os.path.join(_RUNTIME_DIR, "agy_daemon.run.lock")
 _LOG_PATH = os.path.join(_RUNTIME_DIR, "agy_daemon.log")
 
+# 认证失败后的后台自愈退避。强制刷新不受此限制。
+_AUTH_RETRY_DELAYS = (5 * 60, 15 * 60, 30 * 60)
+
+
+def _auth_retry_delay(attempt: int) -> int:
+    """返回第 attempt 次认证恢复重试后的等待秒数。"""
+    index = max(0, min(attempt, len(_AUTH_RETRY_DELAYS) - 1))
+    return _AUTH_RETRY_DELAYS[index]
+
 
 def _network_ready() -> bool:
     for host in ("daily-cloudcode-pa.googleapis.com", "www.googleapis.com"):
@@ -207,6 +216,9 @@ class _AgySession:
         self.started_at = 0.0
         self.sent_once = False
         self.login_selected = False
+        self.auth_waiting = False
+        self.auth_retry_attempt = 0
+        self.next_auth_retry_at = 0.0
         self.lock = threading.Lock()
         self._start()
 
@@ -225,6 +237,8 @@ class _AgySession:
         pid = os.fork()
         if pid == 0:
             os.setsid()
+            # GUI app 默认从 / 启动。固定到用户目录，避免 workspace/trust 状态漂移。
+            os.chdir(os.path.expanduser("~"))
             os.dup2(slave, 0); os.dup2(slave, 1); os.dup2(slave, 2)
             os.close(master)
             import fcntl, termios, struct
@@ -241,7 +255,25 @@ class _AgySession:
         self.started_at = time.time()
         self.sent_once = False
         self.login_selected = False
+        self.auth_waiting = False
         self._log(f"started agy pid={pid}")
+
+    def _mark_auth_waiting(self) -> None:
+        self.auth_waiting = True
+        if self.next_auth_retry_at == 0:
+            delay = _auth_retry_delay(self.auth_retry_attempt)
+            self.next_auth_retry_at = time.time() + delay
+
+    def _mark_ready(self) -> None:
+        self.auth_waiting = False
+        self.auth_retry_attempt = 0
+        self.next_auth_retry_at = 0.0
+
+    def _restart_for_auth(self, reason: str) -> None:
+        self.auth_retry_attempt += 1
+        self.next_auth_retry_at = 0.0
+        self._log(f"restarting agy to reload authentication: {reason}")
+        self._start()
 
     def _is_running(self) -> bool:
         if self.pid is None:
@@ -282,6 +314,7 @@ class _AgySession:
             txt = self.buf.decode('utf-8', 'replace')
             if not self.login_selected and 'Select login method:' in txt and 'Google OAuth' in txt:
                 self.login_selected = True
+                self._mark_auth_waiting()
                 self._log("agy is waiting for manual login")
             # 信任目录确认页(重启后/换工作区首次出现):自动选 Yes
             if 'trust this folder' in txt or 'trust the contents' in txt:
@@ -294,12 +327,13 @@ class _AgySession:
                 self._read_for(0.5)
                 txt = self.buf.decode('utf-8', 'replace')
             if ('AI Pro' in txt or 'Pro (High)' in txt) and time.time() - self.started_at > 5:
+                self._mark_ready()
                 return True
         return False
 
     def _auth_waiting_result(self, text: str):
         if 'Select login method:' in text and 'Google OAuth' in text:
-            self._log("waiting for manual Antigravity login")
+            self._mark_auth_waiting()
             return {
                 'status': 'error',
                 'detail': '等待手动登录 Antigravity',
@@ -357,11 +391,17 @@ class _AgySession:
                 break
         return groups, text
 
-    def fetch_usage(self, timeout_total: int = 28) -> dict:
+    def fetch_usage(self, timeout_total: int = 28, force_restart: bool = False) -> dict:
         with self.lock:
             try:
                 if not self._is_running():
                     self._start()
+                auth_restarted = False
+                retry_due = self.auth_waiting and time.time() >= self.next_auth_retry_at
+                if self.auth_waiting and (force_restart or retry_due):
+                    reason = "forced refresh" if force_restart else "scheduled auth retry"
+                    self._restart_for_auth(reason)
+                    auth_restarted = True
                 ready = self._wait_ready(max(8, timeout_total - 10))
                 if not ready:
                     text = _clean(self.buf.decode('utf-8', 'replace'))
@@ -374,7 +414,19 @@ class _AgySession:
                 if not ready:
                     auth_waiting = self._auth_waiting_result(text)
                     if auth_waiting:
-                        return auth_waiting
+                        if force_restart and not auth_restarted:
+                            reason = "forced refresh"
+                            self._restart_for_auth(reason)
+                            ready = self._wait_ready(max(8, timeout_total - 10))
+                            text = _clean(self.buf.decode('utf-8', 'replace'))
+                            if not ready:
+                                return self._auth_waiting_result(text) or {
+                                    'status': 'error', 'detail': 'agy 未就绪',
+                                    'raw': text[-800:] if text else '',
+                                }
+                        else:
+                            return auth_waiting
+                if not ready:
                     return {'status': 'error', 'detail': 'agy 未就绪', 'raw': text[-800:] if text else ''}
 
                 groups, text = self._request_usage_once(wait_seconds=10)
@@ -446,6 +498,8 @@ def _run_daemon() -> None:
             cmd = conn.recv(64).decode('utf-8', 'replace').strip()
             if cmd == "usage":
                 result = session.fetch_usage()
+            elif cmd == "usage_force":
+                result = session.fetch_usage(force_restart=True)
             elif cmd == "ping":
                 result = {"status": "ok", "detail": "pong"}
             elif cmd == "shutdown":
@@ -469,7 +523,10 @@ def _run_daemon() -> None:
                 continue
             threading.Thread(target=handle, args=(conn,), daemon=True).start()
     finally:
-        session.close()
+        # shutdown 可能与仍在执行的 usage 请求并发。等待会话锁，避免两个线程同时
+        # 读取/关闭同一个 PTY，导致 daemon 卡在 os.read 并长期占用 run lock。
+        with session.lock:
+            session.close()
         server.close()
         try:
             os.unlink(_SOCKET_PATH)
@@ -518,7 +575,21 @@ def _ensure_daemon(timeout: float = 20) -> dict:
         return {"status": "error", "detail": f"agy daemon 启动失败: {last_err}"}
 
 
-def fetch_usage(timeout_total: int = 28) -> dict:
+def _replace_legacy_daemon(timeout: float = 15) -> dict:
+    """升级旧协议 daemon，使源码更新无需用户手动清理后台进程。"""
+    try:
+        _daemon_request("shutdown", 3)
+    except Exception:
+        pass
+    deadline = time.time() + timeout
+    while time.time() < deadline and os.path.exists(_SOCKET_PATH):
+        time.sleep(0.2)
+    if os.path.exists(_SOCKET_PATH):
+        return {"status": "error", "detail": "旧版 agy daemon 关闭超时"}
+    return _ensure_daemon()
+
+
+def fetch_usage(timeout_total: int = 28, force: bool = False) -> dict:
     """通过常驻 agy daemon 实时发送 /usage 并返回结构化配额。"""
     if not _network_ready():
         return {'status': 'error', 'detail': '网络未就绪'}
@@ -526,7 +597,14 @@ def fetch_usage(timeout_total: int = 28) -> dict:
     if ready.get("status") != "ok":
         return ready
     try:
-        return _daemon_request("usage", timeout_total + 15)
+        cmd = "usage_force" if force else "usage"
+        result = _daemon_request(cmd, timeout_total + 15)
+        if force and result.get("detail") == "未知命令":
+            ready = _replace_legacy_daemon()
+            if ready.get("status") != "ok":
+                return ready
+            result = _daemon_request(cmd, timeout_total + 15)
+        return result
     except Exception as e:
         return {'status': 'error', 'detail': f'daemon 请求失败: {type(e).__name__}: {e}'}
 

@@ -234,7 +234,9 @@ def probe_antigravity() -> dict:
         out["detail"] = "agy_usage.py 缺失"
         return out
 
-    result = fetch_usage()
+    # 展开面板时 Swift 端会设置 NOTCHQUOTA_FORCE=1。将它传给 agy daemon，
+    # 使已在终端重新登录后的后台旧会话能够立即重载 Keychain。
+    result = fetch_usage(force=os.environ.get("NOTCHQUOTA_FORCE") == "1")
     if result.get("status") != "ok":
         out["detail"] = result.get("detail", "未知错误")
         return out
