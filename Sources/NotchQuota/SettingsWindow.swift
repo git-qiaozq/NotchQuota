@@ -16,7 +16,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             return
         }
         // 固定合理的窗口尺寸(经过布局计算,比例协调)
-        let W: CGFloat = 380, H: CGFloat = 624
+        let W: CGFloat = 380, H: CGFloat = 664
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: W, height: H),
                          styleMask: [.titled, .closable],
                          backing: .buffered, defer: false)
@@ -108,7 +108,9 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         [launchTitle, mainLbl, hintLbl, sw].forEach { launchCard.addSubview($0) }
 
         // ── 显示卡片 ──
-        let visibleH: CGFloat = 186
+        // 列表区域加高到 5 行可见(156),并用 ScrollView 包裹:
+        // 未来再加服务时直接滚动,不再被裁掉
+        let visibleH: CGFloat = 220
         let visibleY = launchY - 16 - visibleH
         let visibleCard = makeCard(y: visibleY, h: visibleH)
 
@@ -126,8 +128,16 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         visibleHint.frame.origin = NSPoint(x: 16, y: visibleH - 45)
         visibleCard.addSubview(visibleHint)
 
-        let cardList = CardOrderListView(frame: NSRect(x: 12, y: 12, width: cardW - 24, height: 122))
-        visibleCard.addSubview(cardList)
+        // ScrollView 包住列表,行数超出可视高度时可滚动
+        let listAreaH: CGFloat = 156   // (28+3)*5 + 1,5 行刚好全可见
+        let scroll = NSScrollView(frame: NSRect(x: 12, y: 12, width: cardW - 24, height: listAreaH))
+        scroll.hasVerticalScroller = true
+        scroll.scrollerStyle = .overlay
+        scroll.drawsBackground = false
+        scroll.autohidesScrollers = true
+        let cardList = CardOrderListView(frame: NSRect(x: 0, y: 0, width: cardW - 24, height: listAreaH))
+        scroll.documentView = cardList
+        visibleCard.addSubview(scroll)
 
         // ── 退出卡片 ──
         let quitH: CGFloat = 96
@@ -213,6 +223,12 @@ final class CardOrderListView: NSView {
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
         rebuildRows()
+        // 高度撑到能容纳所有行:行数 ≤ 可视高度时保持原高(不引入滚动),
+        // 超出时变高,由外层 NSScrollView 滚动
+        let needed = CGFloat(cards.count) * (rowHeight + rowGap) - rowGap
+        if needed > frame.height {
+            setFrameSize(NSSize(width: frame.width, height: needed))
+        }
     }
 
     required init?(coder: NSCoder) {

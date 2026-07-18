@@ -664,8 +664,115 @@ def probe_hermes() -> dict:
     return out
 
 
+# ───────────────────────── Kimi ─────────────────────────
+# Kimi Code (Coding Plan) 用量: 用 Hermes .env 里的 KIMI_API_KEY 调
+# api.kimi.com/coding/v1/usages。响应含 usage(周窗口) + limits[](5h 窗口),
+# limit/used 都是字符串形式的"次数"(总额 100)。
+
+def _kimi_find_key() -> str:
+    """从 Hermes .env 读 Kimi Code API key。"""
+    env = os.path.join(HOME, ".hermes", ".env")
+    if not os.path.exists(env):
+        return ""
+    keys = ["KIMI_API_KEY", "KIMI_CN_API_KEY", "KIMI_CODING_API_KEY"]
+    pat = re.compile(r'\s*(' + '|'.join(keys) + r')\s*=\s*["\']?([A-Za-z0-9._\-]+)')
+    with open(env) as f:
+        for line in f:
+            m = pat.match(line)
+            if m:
+                return m.group(2)
+    return ""
+
+
+def _kimi_parse_reset(reset_time: str) -> float:
+    """ISO 时间字符串 → epoch 秒。失败返回 0。"""
+    try:
+        dt = datetime.fromisoformat(reset_time.replace("Z", "+00:00"))
+        return dt.timestamp()
+    except Exception:
+        return 0
+
+
+def probe_kimi() -> dict:
+    """Kimi Code (Coding Plan) 5h/周窗口用量。"""
+    out = {
+        "id": "kimi", "name": "Kimi", "plan": "Coding Plan",
+        "status": "error", "detail": "", "metrics": [],
+        "url": "https://www.kimi.com/code/console",
+    }
+    try:
+        key = _kimi_find_key()
+        if not key:
+            out["detail"] = "未配置 Kimi key"
+            return out
+
+        import urllib.request, urllib.error
+        req = urllib.request.Request(
+            "https://api.kimi.com/coding/v1/usages",
+            headers={
+                "Authorization": f"Bearer {key}",
+                "User-Agent": "KimiCLI/1.6",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            code = e.code
+            if code == 401:
+                out["detail"] = "key 无效(需 Kimi Code 的 sk-kimi- 密钥)"
+            else:
+                out["detail"] = f"HTTP {code}"
+            return out
+        except urllib.error.URLError:
+            out["detail"] = "网络波动"
+            return out
+
+        def _pct(d: dict) -> float:
+            try:
+                limit = float(d.get("limit") or 0)
+                used = float(d.get("used") or 0)
+                return round(used / limit * 100, 1) if limit > 0 else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+
+        metrics = []
+        # 5h 窗口: limits[0].window.duration=300 分钟
+        for L in data.get("limits", []) or []:
+            detail = L.get("detail") or {}
+            if not detail:
+                continue
+            metrics.append({
+                "label": "5h 窗口",
+                "used_pct": _pct(detail),
+                "reset": _human_reset(_kimi_parse_reset(detail.get("resetTime", ""))),
+            })
+            break  # 只取第一个(实测只有一个 5h 窗口)
+        # 周窗口: usage
+        usage = data.get("usage") or {}
+        if usage:
+            metrics.append({
+                "label": "周窗口",
+                "used_pct": _pct(usage),
+                "reset": _human_reset(_kimi_parse_reset(usage.get("resetTime", ""))),
+            })
+
+        # 会员等级
+        level = (data.get("user", {}).get("membership", {}) or {}).get("level", "")
+        if level:
+            out["plan"] = f"Coding {level.replace('LEVEL_', '').capitalize()}"
+
+        out["metrics"] = metrics
+        out["status"] = "ok"
+        out["detail"] = "实时"
+    except Exception as e:
+        out["detail"] = f"{type(e).__name__}"
+    return out
+
+
 def main():
-    result = [probe_codex(), probe_claude(), probe_hermes(), probe_antigravity()]
+    result = [probe_codex(), probe_claude(), probe_hermes(), probe_kimi(), probe_antigravity()]
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

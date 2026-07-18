@@ -14,6 +14,7 @@ enum QuotaDisplayPreferences {
         QuotaCardOption(id: "codex", name: "Codex"),
         QuotaCardOption(id: "claude", name: "Claude"),
         QuotaCardOption(id: "hermes", name: "Z.AI"),
+        QuotaCardOption(id: "kimi", name: "Kimi"),
         QuotaCardOption(id: "antigravity", name: "Antigravity"),
     ]
 
