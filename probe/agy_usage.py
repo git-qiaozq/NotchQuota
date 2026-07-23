@@ -361,6 +361,20 @@ class _AgySession:
                 return reason
         return None
 
+    def _recover_screen(self) -> None:
+        """尝试从卡住的 TUI 界面(倒计时/弹窗/配额视图)回到提示符。"""
+        if self.master is None:
+            return
+        try:
+            os.write(self.master, b'\x1b')   # ESC: 关闭可能打开的视图
+            time.sleep(0.2)
+            os.write(self.master, b'\x03')   # Ctrl+C: 取消进行中的操作
+            time.sleep(0.2)
+            os.write(self.master, b'\x1b')
+            self._read_for(1.0)
+        except OSError:
+            pass
+
     def _request_usage_once(self, wait_seconds: float = 9):
         marker = f"__NOTCHQUOTA_USAGE_{int(time.time() * 1000)}__"
         self.buf += f"\n{marker}\n".encode()
@@ -368,10 +382,9 @@ class _AgySession:
         time.sleep(0.15)
         os.write(self.master, b'\x15')
         time.sleep(0.05)
-        for ch in '/usage':
-            os.write(self.master, ch.encode())
-            time.sleep(0.03)
-        os.write(self.master, b'\r')
+        # 一次性写入完整命令:逐字符输入时自动补全高亮可能漂移(如 '/usa' 高亮跳到
+        # '/agy-customizations'),回车会选错命令;原子写入消除该竞态。
+        os.write(self.master, b'/usage\r')
         self.sent_once = True
 
         deadline = time.time() + wait_seconds
@@ -389,6 +402,12 @@ class _AgySession:
                 recent = text.split(marker, 1)[-1]
                 groups = _parse_usage(recent)
                 break
+        if groups:
+            # 关闭配额视图,让会话回到干净提示符,避免屏幕状态随轮询逐渐漂移
+            try:
+                os.write(self.master, b'\x1b')
+            except OSError:
+                pass
         return groups, text
 
     def fetch_usage(self, timeout_total: int = 28, force_restart: bool = False) -> dict:
@@ -426,6 +445,17 @@ class _AgySession:
                                 }
                         else:
                             return auth_waiting
+                if not ready:
+                    # 卡屏自愈:已认证但 TUI 不在提示符状态(如网络抖动后卡在
+                    # 倒计时/弹窗界面,缓冲区被持续重绘冲刷)。先 ESC+Ctrl+C 尝试
+                    # 回到提示符;无效则重启 agy 会话重试一次,避免永久卡死。
+                    self._log("not ready after auth checks; attempting screen recovery")
+                    self._recover_screen()
+                    ready = self._wait_ready(6)
+                    if not ready:
+                        self._log("screen recovery failed; restarting agy session")
+                        self._start()
+                        ready = self._wait_ready(max(8, timeout_total - 10))
                 if not ready:
                     return {'status': 'error', 'detail': 'agy 未就绪', 'raw': text[-800:] if text else ''}
 
