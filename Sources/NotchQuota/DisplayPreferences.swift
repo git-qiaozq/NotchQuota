@@ -16,6 +16,7 @@ enum QuotaDisplayPreferences {
         QuotaCardOption(id: "hermes", name: "Z.AI"),
         QuotaCardOption(id: "kimi", name: "Kimi"),
         QuotaCardOption(id: "antigravity", name: "Antigravity"),
+        QuotaCardOption(id: "deepseek", name: "DeepSeek"),
     ]
 
     private static let hiddenCardIDsKey = "hiddenQuotaCardIDs"

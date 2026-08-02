@@ -1,8 +1,8 @@
 # NotchQuota
 
-在 MacBook 刘海处实时查看 **Codex / Claude / Z.AI / Antigravity** 四个 AI 平台的套餐用量。
+在 MacBook 刘海处实时查看 **Codex / Claude / Z.AI / Antigravity / DeepSeek** 的套餐用量与账户余额。
 
-鼠标划过刘海 → 面板像 Dynamic Island 一样从刘海胀开包裹刘海，展示四家用量；鼠标移开即收回。
+鼠标划过刘海 → 面板像 Dynamic Island 一样从刘海胀开包裹刘海，展示各家用量；鼠标移开即收回。
 
 ## 能力
 
@@ -12,8 +12,9 @@
 | **Claude** | 5h + 周窗口 已用百分比、重置倒计时 | 最小请求 + 响应 header 的 `ratelimit-unified` 字段 |
 | **Z.AI** | 5h + 周窗口 已用百分比、重置倒计时 | `open.bigmodel.cn/api/monitor/usage/quota/limit` 实时 API |
 | **Antigravity** | 两模型组(Gemini / Claude&GPT)×(5h/周) 已用百分比 | `agy` CLI 的 `/usage` (常驻 daemon 复用会话) |
+| **DeepSeek** | 账户余额(充值/赠送构成) | `api.deepseek.com/user/balance` 实时 API |
 
-- 四家**全部实时**，每 60 秒自动刷新；展开面板时按需强制刷新
+- 六家**全部实时**，每 60 秒自动刷新；展开面板时按需强制刷新
 - 点击卡片跳转到对应平台的用量详情页
 - 完整生命周期：应用图标、设置窗口、开机自启开关、完全退出（退出时优雅关闭 daemon）
 
@@ -24,10 +25,11 @@ quota_probe.py (Python)                    Sources/NotchQuota (Swift/AppKit)
 ┌──────────────────────────────────┐       ┌─────────────────────────────────┐
 │ 四家数据采集器(统一 JSON)          │       │  QuotaFetcher 启动子进程         │
 │ · Codex      wham/usage API       │       │    ↓ stdout JSON                │
-│ · Claude     haiku 最小请求+header │──────▶│  PanelView 渲染四家卡片          │
+│ · Claude     haiku 最小请求+header │──────▶│  PanelView 渲染六家卡片          │
 │ · Z.AI       quota/limit API      │       │  AppController 刘海热区/动画/    │
 │ · Antigravity agy daemon /usage   │       │    轮询兜底/活跃门控/生命周期     │
-│   (agy_usage.py pty 常驻会话)     │       │  SettingsWindow 设置窗口         │
+│ · DeepSeek   user/balance API     │       │  SettingsWindow 设置窗口         │
+│   (agy_usage.py pty 常驻会话)     │       │                                  │
 └──────────────────────────────────┘       └─────────────────────────────────┘
 ```
 
@@ -47,6 +49,8 @@ python3 probe/quota_probe.py     # 直接打印四家统一 JSON
   - Codex：`~/.codex/auth.json`（Codex CLI 登录后自动生成）
   - Claude：keychain `Claude Code-credentials`（Claude Code 登录后写入）
   - Z.AI：`~/.hermes/.env` 里的 `GLM_API_KEY`（或 `ZAI_API_KEY` 等）
+  - Kimi：`~/.hermes/.env` 里的 `KIMI_API_KEY`
+  - DeepSeek：`~/.hermes/.env` 里的 `DEEPSEEK_API_KEY`
   - Antigravity：`agy` 已登录
 
 ## 构建
@@ -75,7 +79,7 @@ pkill -f NotchQuota.app; bash ~/NotchQuota/build_app.sh; open ~/Applications/Not
 # 关闭（app 退出时会自动关闭 agy daemon）
 pkill -f NotchQuota.app
 
-# 单独看四家数据（不开 app）
+# 单独看五家数据（不开 app）
 python3 ~/NotchQuota/probe/quota_probe.py
 ```
 
@@ -113,6 +117,8 @@ NotchQuota/
 | **Codex** | 节点 IP 信誉差 → Cloudflare soft block（连接建立但不返回数据 → 超时）| **失败退避**：连续失败 2 次后 5 分钟才试一次（不每分钟撞墙），成功立刻恢复；+ 5 分钟轻缓存 |
 | **Claude** | 高频 + 跨国漂移 → 触发 Anthropic 风控 → **封号** | **降频**（15 分钟缓存）+ **活跃门控**（睡眠/锁屏暂停）+ **出口漂移检测**（Clash 切节点换国家 → 跳过本轮）|
 | **Z.AI** | 无（国内直连）| — |
+| **Kimi** | 无（国内直连）| — |
+| **DeepSeek** | 无（国内直连，余额查询轻量）| — |
 | **Antigravity** | 每次启动 agy 触发 OAuth 弹窗 | **daemon 常驻复用会话** + 重启后信任页自动确认 |
 
 ### Antigravity daemon

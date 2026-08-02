@@ -15,6 +15,23 @@ struct QuotaMetric: Decodable {
     }
 }
 
+// DeepSeek 余额(按量付费):无套餐比例,只有账户余额
+struct BalanceInfo: Decodable {
+    let currency: String
+    let total: String
+    let granted: String
+    let toppedUp: String
+    let isAvailable: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case currency
+        case total
+        case granted
+        case toppedUp = "topped_up"
+        case isAvailable = "is_available"
+    }
+}
+
 struct QuotaService: Decodable, Identifiable {
     let id: String
     let name: String
@@ -23,6 +40,7 @@ struct QuotaService: Decodable, Identifiable {
     let detail: String
     let metrics: [QuotaMetric]
     let url: String
+    let balance: BalanceInfo?   // 仅余额型服务(DeepSeek)有值,其余为 nil
 
     var isOK: Bool { status == "ok" }
 }

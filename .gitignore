@@ -16,5 +16,8 @@ AppIcon.iconset/
 debug.log
 *.log
 
+# opencode 计划/状态
+.omo/
+
 # macOS
 .DS_Store

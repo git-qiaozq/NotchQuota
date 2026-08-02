@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-quota_probe.py — 统一采集 Codex / Antigravity / Hermes 三家套餐用量。
+quota_probe.py — 统一采集 Codex / Claude / Z.AI / Kimi / Antigravity / DeepSeek 用量与余额。
 输出一份 JSON 数组到 stdout，供 NotchQuota.app 渲染。
 
-每个采集器都用 try/except 包住：单家失败不影响其它两家，
+每个采集器都用 try/except 包住：单家失败不影响其它几家，
 失败时返回 status="error" + 简短原因，UI 据此降级显示。
 """
 import json, os, re, base64, subprocess, time
@@ -771,8 +771,77 @@ def probe_kimi() -> dict:
     return out
 
 
+# ─────────────────────── DeepSeek ───────────────────────
+# DeepSeek 是按量付费,没有套餐用量比例,只有账户余额。
+# 国内直连、请求轻量,无需缓存/退避(和 Z.AI/Kimi 同级)。
+
+def _deepseek_find_key() -> str:
+    """从 Hermes .env 读 DeepSeek API key。"""
+    env = os.path.join(HOME, ".hermes", ".env")
+    if not os.path.exists(env):
+        return ""
+    keys = ["DEEPSEEK_API_KEY", "DEEPSEEK_KEY"]
+    pat = re.compile(r'\s*(' + '|'.join(keys) + r')\s*=\s*["\']?([A-Za-z0-9._\-]+)')
+    with open(env) as f:
+        for line in f:
+            m = pat.match(line)
+            if m:
+                return m.group(2)
+    return ""
+
+
+def probe_deepseek() -> dict:
+    """查 DeepSeek API 账户余额(按量付费,无套餐用量)。
+    balance 字段交给 Swift 渲染专属的余额卡片(区别于其它家的百分比指标)。"""
+    out = {
+        "id": "deepseek", "name": "DeepSeek", "plan": "按量付费",
+        "status": "error", "detail": "", "metrics": [],
+        "url": "https://platform.deepseek.com/usage",
+        "balance": None,
+    }
+    try:
+        key = _deepseek_find_key()
+        if not key:
+            out["detail"] = "未配置 DeepSeek key"
+            return out
+
+        import urllib.request, urllib.error
+        req = urllib.request.Request(
+            "https://api.deepseek.com/user/balance",
+            headers={"Authorization": f"Bearer {key}", "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            code = e.code
+            out["detail"] = "key 无效" if code == 401 else f"HTTP {code}"
+            return out
+        except urllib.error.URLError:
+            out["detail"] = "网络波动"
+            return out
+
+        infos = data.get("balance_infos") or []
+        if not infos:
+            out["detail"] = "无余额信息"
+            return out
+        info = infos[0]
+        out["balance"] = {
+            "currency": info.get("currency", "CNY"),
+            "total": info.get("total_balance", "0"),
+            "granted": info.get("granted_balance", "0"),
+            "topped_up": info.get("topped_up_balance", "0"),
+            "is_available": data.get("is_available", True),
+        }
+        out["status"] = "ok"
+        out["detail"] = "实时"
+    except Exception as e:
+        out["detail"] = f"{type(e).__name__}"
+    return out
+
+
 def main():
-    result = [probe_codex(), probe_claude(), probe_hermes(), probe_kimi(), probe_antigravity()]
+    result = [probe_codex(), probe_claude(), probe_hermes(), probe_kimi(),
+              probe_antigravity(), probe_deepseek()]
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

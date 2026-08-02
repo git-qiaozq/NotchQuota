@@ -134,7 +134,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         scroll.hasVerticalScroller = true
         scroll.scrollerStyle = .overlay
         scroll.drawsBackground = false
-        scroll.autohidesScrollers = true
+        scroll.autohidesScrollers = false   // 常驻滚动条:6 张卡后有内容在下方,提示可滚动
         let cardList = CardOrderListView(frame: NSRect(x: 0, y: 0, width: cardW - 24, height: listAreaH))
         scroll.documentView = cardList
         visibleCard.addSubview(scroll)
@@ -211,6 +211,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
 final class CardOrderListView: NSView {
     override var mouseDownCanMoveWindow: Bool { false }
+    // 翻转坐标系:行从顶部 y=0 往下排,NSScrollView 才能正确滚动(6 张卡后需要滚动)
+    override var isFlipped: Bool { true }
 
     private let rowHeight: CGFloat = 28
     private let rowGap: CGFloat = 3
@@ -253,7 +255,7 @@ final class CardOrderListView: NSView {
     }
 
     private func frameForRow(at index: Int) -> NSRect {
-        let y = bounds.height - rowHeight - CGFloat(index) * (rowHeight + rowGap)
+        let y = CGFloat(index) * (rowHeight + rowGap)
         return NSRect(x: 0, y: y, width: bounds.width, height: rowHeight)
     }
 
@@ -283,13 +285,11 @@ final class CardOrderListView: NSView {
               let currentIndex = rows.firstIndex(where: { $0 === row }) else { return }
 
         let location = convert(event.locationInWindow, from: nil)
+        // 翻转坐标系:y=0 在顶部,行随光标移动,限制在列表范围内
         let newY = min(max(location.y - rowHeight / 2, 0), bounds.height - rowHeight)
         row.frame.origin.y = newY
 
-        let proposedIndex = min(
-            max(Int((bounds.height - location.y) / (rowHeight + rowGap)), 0),
-            rows.count - 1
-        )
+        let proposedIndex = min(max(Int(location.y / (rowHeight + rowGap)), 0), rows.count - 1)
         guard proposedIndex != currentIndex else { return }
 
         let movedRow = rows.remove(at: currentIndex)
