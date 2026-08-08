@@ -123,5 +123,53 @@ class DaemonProtocolTests(unittest.TestCase):
         replace.assert_called_once_with()
 
 
+class ParseUsageTests(unittest.TestCase):
+    def test_parse_usage_with_remaining_headers(self):
+        raw_text = """
+GEMINI MODELS
+
+  Models within this group: Gemini Flash, Gemini Pro
+
+  Weekly Limit Remaining
+
+    [██████████████████████████████████████████████████] 99.34%
+
+    99% remaining · Refreshes in 36h 35m
+
+  Five Hour Limit Remaining
+
+    [█████████████████████████████████████████████████░] 97.60%
+
+    98% remaining · Refreshes in 4h 58m
+
+CLAUDE AND GPT MODELS
+
+  Models within this group: Claude Opus, Claude Sonnet, GPT-OSS
+
+  Weekly Limit Remaining
+
+    [██████████████████████████████████████████████████] 100.00%
+
+    Quota available
+
+  Five Hour Limit Remaining
+
+    [██████████████████████████████████████████████████] 100.00%
+
+    Quota available
+"""
+        groups = agy_usage._parse_usage(raw_text)
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(groups[0]["group"], "GEMINI MODELS")
+        self.assertEqual(groups[0]["weekly_limit"]["used_pct"], 1.0)
+        self.assertEqual(groups[0]["weekly_limit"]["reset_hours"], 36.58)
+        self.assertEqual(groups[0]["five_hour_limit"]["used_pct"], 2.0)
+        self.assertEqual(groups[0]["five_hour_limit"]["reset_hours"], 4.97)
+
+        self.assertEqual(groups[1]["group"], "CLAUDE AND GPT MODELS")
+        self.assertEqual(groups[1]["weekly_limit"]["used_pct"], 0.0)
+        self.assertEqual(groups[1]["five_hour_limit"]["used_pct"], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

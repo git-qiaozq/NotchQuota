@@ -34,19 +34,20 @@ def _parse_usage(text: str) -> list:
         limits = {}
         for win in ['Weekly Limit', 'Five Hour Limit']:
             key = win.lower().replace(' ', '_')
-            # 格式1(常用): [进度条] X%  Y% remaining · Refreshes in Zh Wm
+            # 格式1(常用): [进度条] X%  Y% remaining · Refreshes in Zh Wm (支持 optional "Remaining")
             wp = re.search(
-                rf'{win}\s*\n\s*\[[█░]+\]\s*([\d.]+)%\s*\n\s*(\d+)%\s*remaining'
+                rf'{win}(?:\s+Remaining)?\s*\n\s*\[[█░]+\]\s*([\d.]+)%\s*\n\s*(\d+)%\s*remaining'
                 rf'(?:.*?Refreshes in\s*([^\n]+?))?\s*\n',
                 block, re.S)
             if wp:
                 reset_raw = (wp.group(3) or '').strip().rstrip('.')
-                hm = re.search(r'(?:(\d+)h)?\s*(?:(\d+)m)?', reset_raw)
+                hm = re.search(r'(?:(\d+)d)?\s*(?:(\d+)h)?\s*(?:(\d+)m)?', reset_raw)
                 total_h = None
-                if hm and (hm.group(1) or hm.group(2)):
-                    h = int(hm.group(1) or 0)
-                    m = int(hm.group(2) or 0)
-                    total_h = round(h + m / 60, 2)
+                if hm and (hm.group(1) or hm.group(2) or hm.group(3)):
+                    d = int(hm.group(1) or 0)
+                    h = int(hm.group(2) or 0)
+                    m = int(hm.group(3) or 0)
+                    total_h = round(d * 24 + h + m / 60, 2)
                 limits[key] = {
                     'used_pct': round(100 - float(wp.group(2)), 1),
                     'remaining_pct': float(wp.group(2)),
@@ -57,7 +58,7 @@ def _parse_usage(text: str) -> list:
                 continue
             # 格式2(配额充裕): [进度条] X%  Quota available
             qa = re.search(
-                rf'{win}\s*\n\s*\[[█░]+\]\s*([\d.]+)%\s*\n\s*Quota available',
+                rf'{win}(?:\s+Remaining)?\s*\n\s*\[[█░]+\]\s*([\d.]+)%\s*\n\s*Quota available',
                 block, re.S)
             if qa:
                 pct = float(qa.group(1))
@@ -200,7 +201,7 @@ def _auth_retry_delay(attempt: int) -> int:
 
 
 def _network_ready() -> bool:
-    for host in ("daily-cloudcode-pa.googleapis.com", "www.googleapis.com"):
+    for host in ("cloudcode-pa.googleapis.com", "www.googleapis.com"):
         try:
             socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
         except OSError:
