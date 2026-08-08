@@ -1,6 +1,6 @@
 # NotchQuota
 
-在 MacBook 刘海处实时查看 **Codex / Claude / Z.AI / Antigravity / DeepSeek** 的套餐用量与账户余额。
+在 MacBook 刘海处实时查看 **Codex / Claude / Z.AI / Kimi / Antigravity / DeepSeek / OpenCode Go** 的套餐用量与账户余额。
 
 鼠标划过刘海 → 面板像 Dynamic Island 一样从刘海胀开包裹刘海，展示各家用量；鼠标移开即收回。
 
@@ -13,6 +13,8 @@
 | **Z.AI** | 5h + 周窗口 已用百分比、重置倒计时 | `open.bigmodel.cn/api/monitor/usage/quota/limit` 实时 API |
 | **Antigravity** | 两模型组(Gemini / Claude&GPT)×(5h/周) 已用百分比 | `agy` CLI 的 `/usage` (常驻 daemon 复用会话) |
 | **DeepSeek** | 账户余额(充值/赠送构成) | `api.deepseek.com/user/balance` 实时 API |
+| **OpenCode Go** | 5h/周/月 用量百分比 + 重置倒计时 | 网页抓取 `opencode.ai/workspace/{id}/go` |
+| **OpenCode Go** | 5h/周/月 用量百分比 + 重置倒计时 | 网页抓取 `opencode.ai/workspace/{id}/go` (auth cookie) |
 
 - 六家**全部实时**，每 60 秒自动刷新；展开面板时按需强制刷新
 - 点击卡片跳转到对应平台的用量详情页
@@ -120,6 +122,22 @@ NotchQuota/
 | **Kimi** | 无（国内直连）| — |
 | **DeepSeek** | 无（国内直连，余额查询轻量）| — |
 | **Antigravity** | 每次启动 agy 触发 OAuth 弹窗 | **daemon 常驻复用会话** + 重启后信任页自动确认 |
+| **OpenCode Go** | auth cookie 过期 → 无法获取用量 | 过期时提示用户重新从浏览器复制 cookie |
+
+### OpenCode Go 配置
+
+OpenCode Go 没有公开 API，通过 workspace ID + auth cookie 从网页控制台抓取用量数据。
+
+1. 在浏览器中登录 `https://opencode.ai`，进入 Go 用量页面（URL 含 `wrk_...`）
+2. 打开 DevTools → Application → Cookies → `opencode.ai` → 复制 `auth` cookie 的值
+3. 创建 `~/.config/notchquota/opencode_go.json`：
+
+```json
+{
+  "workspaceId": "wrk_你的workspaceID",
+  "authCookie": "Fe26.2**...你的auth cookie..."
+}
+```
 
 ### Antigravity daemon
 - 直调 Google REST API 会因 keychain token 被 IDE 刷新丢失 Pro scope 而 403，故改用 pty 驱动 `agy` 本身（它自管 token/gRPC/license）

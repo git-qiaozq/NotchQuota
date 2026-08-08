@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 quota_probe.py — 统一采集 Codex / Claude / Z.AI / Kimi / Antigravity / DeepSeek 用量与余额。
 输出一份 JSON 数组到 stdout，供 NotchQuota.app 渲染。
@@ -839,9 +840,114 @@ def probe_deepseek() -> dict:
     return out
 
 
+# ─────────────────── OpenCode Go ───────────────────
+# OpenCode Go 是 $10/月的订阅计划,提供 5h 滚动($12)、周($30)、月($60) 三个用量窗口。
+# 没有公开 API,通过 workspace ID + auth cookie 抓取网页控制台提取用量。
+#
+# 配置: ~/.config/notchquota/opencode_go.json
+# {
+#   "workspaceId": "wrk_xxxxxxxxxxxxxxxxxxxxxxxx",
+#   "authCookie": "Fe26.2**..."
+# }
+
+_GO_CONFIG = os.path.join(HOME, ".config", "notchquota", "opencode_go.json")
+
+
+def _go_read_config() -> dict:
+    """读取 OpenCode Go 配置(workspaceId + authCookie)。"""
+    try:
+        if os.path.exists(_GO_CONFIG):
+            return json.load(open(_GO_CONFIG))
+    except Exception:
+        pass
+    return {}
+
+
+def _go_parse_usage(html: str) -> list[dict] | None:
+    """从 SolidJS SSR 页面提取 rolling/weekly/monthly 用量。"""
+    # 查找 go 充值数据中的用量字段
+    # 格式: rollingUsage:$R[N]={status:"ok",resetInSec:18000,usagePercent:0}
+    import re as _re
+
+    windows = {}
+    for label, key in [("5h 窗口", "rollingUsage"), ("周窗口", "weeklyUsage"),
+                       ("月窗口", "monthlyUsage")]:
+        m = _re.search(
+            rf'{key}:\$R\[\d+\]=\{{status:"([^"]+)",resetInSec:(\d+),usagePercent:([\d.]+)}}',
+            html)
+        if not m:
+            continue
+        status, reset_sec, pct = m.group(1), int(m.group(2)), float(m.group(3))
+        if status != "ok":
+            continue
+        windows[label] = {
+            "used_pct": round(pct, 1),
+            "reset": _human_reset(time.time() + reset_sec) if reset_sec else "",
+        }
+    if not windows:
+        return None
+
+    metrics = []
+    for label in ("5h 窗口", "周窗口", "月窗口"):
+        if label in windows:
+            metrics.append({"label": label, **windows[label]})
+    return metrics
+
+
+def probe_opencode_go() -> dict:
+    """抓取 OpenCode Go 用量面板,返回 5h/周/月 三个窗口用量。"""
+    out = {
+        "id": "opencode-go", "name": "OpenCode Go", "plan": "Go",
+        "status": "error", "detail": "", "metrics": [],
+        "url": "https://opencode.ai/workspace/wrk_01KEN93SBGJZ26F7NWJRHFX29K/go",
+    }
+    config = _go_read_config()
+    workspace_id = config.get("workspaceId") or os.environ.get("OPENCODE_GO_WORKSPACE_ID", "")
+    auth_cookie = config.get("authCookie") or os.environ.get("OPENCODE_GO_AUTH_COOKIE", "")
+
+    if not workspace_id:
+        out["detail"] = "未配置 workspace ID(请设置 ~/.config/notchquota/opencode_go.json)"
+        return out
+    if not auth_cookie:
+        out["detail"] = "未配置 auth cookie(请设置 ~/.config/notchquota/opencode_go.json)"
+        return out
+
+    import urllib.request, urllib.error
+    try:
+        url = f"https://opencode.ai/workspace/{workspace_id}/go"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Cookie": f"auth={auth_cookie}",
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+                "Accept": "text/html,application/xhtml+xml",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            html = r.read().decode("utf-8", errors="replace")
+
+        metrics = _go_parse_usage(html)
+        if metrics:
+            out["metrics"] = metrics
+            out["status"] = "ok"
+            out["detail"] = "实时"
+        else:
+            out["detail"] = "未找到用量数据(页面结构可能已变化)"
+    except urllib.error.HTTPError as e:
+        if e.code == 302:
+            out["detail"] = "auth cookie 已过期,请重新获取"
+        else:
+            out["detail"] = f"HTTP {e.code}"
+    except urllib.error.URLError:
+        out["detail"] = "网络波动"
+    except Exception as e:
+        out["detail"] = f"{type(e).__name__}"
+    return out
+
+
 def main():
     result = [probe_codex(), probe_claude(), probe_hermes(), probe_kimi(),
-              probe_antigravity(), probe_deepseek()]
+              probe_antigravity(), probe_deepseek(), probe_opencode_go()]
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
