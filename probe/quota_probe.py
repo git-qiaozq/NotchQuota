@@ -343,7 +343,10 @@ def probe_antigravity() -> dict:
         return f"{hh}h{mm}m" if mm else f"{hh}h"
 
     # 每个模型组按固定顺序显示: 5h 窗口在上, 周窗口在下(和 Codex 统一)
+    # 只保留 Gemini 组,过滤掉 Claude&GPT 组
     for g in groups:
+        if "CLAUDE" in g.get("group", "").upper():
+            continue
         five_h = g.get("five_hour_limit", {})
         weekly = g.get("weekly_limit", {})
         if not five_h and not weekly:
