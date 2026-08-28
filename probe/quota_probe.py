@@ -592,28 +592,104 @@ def probe_claude() -> dict:
     return result
 
 
-# ─────────────────────── Hermes / Z.AI ───────────────────────
-# Hermes 当前用 Z.AI/GLM 作为 provider,改用其 API key 查 coding plan 真实配额
-# key 从 Hermes .env 读(GLM_API_KEY / ZAI_API_KEY / Z_AI_API_KEY)
+# ─────────────────────── Z.AI Coding Plan ───────────────────────
+# 用 Z.AI/GLM 的 API key 查 coding plan 真实配额。
+# key 查找顺序: Keychain(NotchQuota/zai) → ~/.config/notchquota/keys.env
+#   → ~/.hermes/.env(向后兼容,历史来源)。
+# bigmodel.cn(中国站)与 api.z.ai(全球站)账号体系不互通,两站接口都试,
+# 记住上次成功的站,避免每次都先撞一次 401。
+
+_ZAI_KEYCHAIN_SERVICE = "NotchQuota/zai"
+_ZAI_ENDPOINTS = [
+    ("https://open.bigmodel.cn/api/monitor/usage/quota/limit", "bigmodel.cn"),
+    ("https://api.z.ai/api/monitor/usage/quota/limit", "z.ai"),
+]
+_ZAI_SITE_FILE = os.path.join(HOME, ".cache", "notchquota_zai_site")
+_zai_last_good = ""          # 上次成功站点的 url,优先重试(app 每次轮请新起进程,需落盘)
+
 
 def _zai_find_key() -> str:
-    """从 Hermes .env 读 Z.AI/GLM API key。"""
-    env = os.path.join(HOME, ".hermes", ".env")
-    if not os.path.exists(env):
-        return ""
-    import re as _re
-    keys = ["GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY", "ZHIPUAI_API_KEY"]
-    pat = _re.compile(r'\s*(' + '|'.join(keys) + r')\s*=\s*["\']?([A-Za-z0-9._\-]+)')
-    with open(env) as f:
-        for line in f:
-            m = pat.match(line)
-            if m:
-                return m.group(2)
+    """Keychain → NotchQuota keys.env → Hermes .env,找到第一个非空 key。"""
+    try:
+        r = subprocess.run(
+            ["security", "find-generic-password", "-s", _ZAI_KEYCHAIN_SERVICE, "-w"],
+            capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            key = r.stdout.strip()
+            if key:
+                return key
+    except Exception:
+        pass
+
+    keys = ["ZAI_API_KEY", "GLM_API_KEY", "Z_AI_API_KEY", "ZHIPUAI_API_KEY"]
+    pat = re.compile(r'\s*(' + '|'.join(keys) + r')\s*=\s*["\']?([A-Za-z0-9._\-]+)')
+    envs = [os.path.join(HOME, ".config", "notchquota", "keys.env"),
+            os.path.join(HOME, ".hermes", ".env")]
+    for env in envs:
+        if not os.path.exists(env):
+            continue
+        try:
+            with open(env) as f:
+                for line in f:
+                    m = pat.match(line)
+                    if m:
+                        return m.group(2)
+        except Exception:
+            pass
     return ""
 
 
+def _zai_fetch_limits(key: str):
+    """调配额接口,返回 (limits, None);全部失败返回 (None, 错误摘要)。
+
+    注意: quota/limit 认证失败时 HTTP 状态码是 200,失败信息在 body 里
+    ({"code":1000,"msg":"身份验证失败","success":false}),必须检查 success。"""
+    global _zai_last_good
+    import urllib.request, urllib.error
+    if not _zai_last_good:
+        try:
+            cached = open(_ZAI_SITE_FILE).read().strip()
+            _zai_last_good = cached if cached in [u for u, _ in _ZAI_ENDPOINTS] else ""
+        except Exception:
+            _zai_last_good = ""
+    urls = ([_zai_last_good] if _zai_last_good else []) + \
+           [u for u, _ in _ZAI_ENDPOINTS if u != _zai_last_good]
+    last_err = ""
+    for url in urls:
+        site = dict(_ZAI_ENDPOINTS).get(url, url)
+        req = urllib.request.Request(
+            url, headers={"Authorization": f"Bearer {key}", "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            last_err = f"{site}: HTTP {e.code}" + ("(key 无效)" if e.code == 401 else "")
+            continue
+        except Exception as e:
+            last_err = f"{site}: {type(e).__name__}"
+            continue
+
+        if not data.get("success"):
+            msg = str(data.get("msg") or f"code {data.get('code')}")
+            last_err = f"{site}: {'key 无效' if data.get('code') == 1000 else msg}"
+            continue
+
+        limits = (data.get("data") or {}).get("limits") or []
+        if not limits:
+            last_err = f"{site}: 响应无窗口数据"
+            continue
+        _zai_last_good = url
+        try:
+            os.makedirs(os.path.dirname(_ZAI_SITE_FILE), exist_ok=True)
+            open(_ZAI_SITE_FILE, "w").write(url)
+        except Exception:
+            pass
+        return limits, None
+    return None, last_err
+
+
 def probe_hermes() -> dict:
-    """调智谱 coding plan 用量 API,返回 5h/周窗口的真实配额。"""
+    """调 Z.AI coding plan 用量 API,返回 5h/周窗口的真实配额。"""
     out = {
         "id": "hermes", "name": "Z.AI", "plan": "Coding Plan",
         "status": "error", "detail": "", "metrics": [],
@@ -625,19 +701,11 @@ def probe_hermes() -> dict:
             out["detail"] = "未配置 Z.AI key"
             return out
 
-        import urllib.request, urllib.error
-        req = urllib.request.Request(
-            "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
-            headers={"Authorization": f"Bearer {key}", "Accept": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=15) as r:
-                data = json.loads(r.read())
-        except urllib.error.HTTPError as e:
-            code = e.code
-            out["detail"] = "key 无效" if code == 401 else f"HTTP {code}"
+        limits, err = _zai_fetch_limits(key)
+        if err:
+            out["detail"] = err
             return out
 
-        limits = data.get("data", {}).get("limits", [])
         metrics = []
         # TOKENS_LIMIT: unit=3 是 5h 窗口, unit=6 是周窗口
         five_h, weekly = None, None
@@ -659,6 +727,10 @@ def probe_hermes() -> dict:
             metrics.append({"label": "5h 窗口", **five_h})
         if weekly:
             metrics.append({"label": "周窗口", **weekly})
+
+        if not metrics:
+            out["detail"] = "响应无窗口数据"
+            return out
 
         out["metrics"] = metrics
         out["status"] = "ok"

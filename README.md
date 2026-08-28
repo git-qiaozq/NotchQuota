@@ -50,7 +50,9 @@ python3 probe/quota_probe.py     # 直接打印四家统一 JSON
 - 已登录配置：
   - Codex：`~/.codex/auth.json`（Codex CLI 登录后自动生成）
   - Claude：keychain `Claude Code-credentials`（Claude Code 登录后写入）
-  - Z.AI：`~/.hermes/.env` 里的 `GLM_API_KEY`（或 `ZAI_API_KEY` 等）
+  - Z.AI：Keychain `NotchQuota/zai`（`security add-generic-password -s NotchQuota/zai -a "$USER" -w <key>`），
+    或 `~/.config/notchquota/keys.env` 里的 `ZAI_API_KEY`；兜底读 `~/.hermes/.env` 的 `GLM_API_KEY`。
+    中国站(bigmodel.cn)与全球站(api.z.ai)的 key 都支持，probe 自动适配
   - Kimi：`~/.hermes/.env` 里的 `KIMI_API_KEY`
   - DeepSeek：`~/.hermes/.env` 里的 `DEEPSEEK_API_KEY`
   - Antigravity：`agy` 已登录
