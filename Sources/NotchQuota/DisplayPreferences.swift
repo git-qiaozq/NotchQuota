@@ -18,6 +18,7 @@ enum QuotaDisplayPreferences {
         QuotaCardOption(id: "antigravity", name: "Antigravity"),
         QuotaCardOption(id: "deepseek", name: "DeepSeek"),
         QuotaCardOption(id: "opencode-go", name: "OpenCode Go"),
+        QuotaCardOption(id: "cursor", name: "Cursor"),
     ]
 
     private static let hiddenCardIDsKey = "hiddenQuotaCardIDs"

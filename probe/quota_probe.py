@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 """
-quota_probe.py — 统一采集 Codex / Claude / Z.AI / Kimi / Antigravity / DeepSeek 用量与余额。
+quota_probe.py — 统一采集 Codex / Claude / Z.AI / Kimi / Antigravity / DeepSeek / OpenCode Go / Cursor 用量与余额。
 输出一份 JSON 数组到 stdout，供 NotchQuota.app 渲染。
 
 每个采集器都用 try/except 包住：单家失败不影响其它几家，
@@ -948,9 +948,173 @@ def probe_opencode_go() -> dict:
     return out
 
 
+# ─────────────────────── Cursor ───────────────────────
+# Cursor Pro 用量:从 Cursor 客户端本地存储(state.vscdb)读 accessToken,
+# 调 DashboardService/GetCurrentPeriodUsage 取当前账单周期的 Included Usage。
+# token 由 Cursor 客户端自动轮换并写回 vscdb,probe 每次运行重读即可,零配置。
+# 该接口是 Cursor 客户端自己状态栏/设置页在用的,调用频率风险低,5 分钟轻缓存即可。
+
+_CURSOR_DB = os.path.join(HOME, "Library", "Application Support", "Cursor",
+                          "User", "globalStorage", "state.vscdb")
+_CURSOR_CACHE = os.path.join(HOME, ".cache", "notchquota_cursor.json")
+_CURSOR_TTL = 300          # 层1: 轻缓存 5 分钟(同 Codex)
+
+
+def _cursor_read_kv(*keys: str) -> dict:
+    """只读模式打开 Cursor 的 state.vscdb,一次取多个 cursorAuth/* 键。
+    WAL 允许并发读;偶发 database is locked 时重试一次,仍失败则返回 {}。"""
+    if not os.path.exists(_CURSOR_DB):
+        return {}
+    import sqlite3
+    uri = "file:" + _CURSOR_DB + "?mode=ro"
+    placeholders = ",".join("?" for _ in keys)
+    for attempt in range(2):
+        try:
+            conn = sqlite3.connect(uri, uri=True, timeout=5)
+            try:
+                rows = conn.execute(
+                    f"SELECT key, value FROM ItemTable WHERE key IN ({placeholders})",
+                    [f"cursorAuth/{k}" for k in keys],
+                ).fetchall()
+                return {k.split("/", 1)[1]: (v or "") for k, v in rows}
+            finally:
+                conn.close()
+        except sqlite3.OperationalError:
+            if attempt == 0:
+                time.sleep(0.5)
+                continue
+            return {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _cursor_jwt_exp(token: str) -> float:
+    """解码 JWT payload 取 exp(秒)。失败返回 0(交给服务端判定)。"""
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return 0
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload))
+        return float(data.get("exp") or 0)
+    except Exception:
+        return 0
+
+
+def _probe_cursor_fresh() -> dict:
+    """实际调 Cursor 后端取实时用量(无门控)。"""
+    out = {
+        "id": "cursor", "name": "Cursor", "plan": "Cursor",
+        "status": "error", "detail": "", "metrics": [],
+        "url": "https://cursor.com/settings",
+    }
+    try:
+        kv = _cursor_read_kv("accessToken", "stripeMembershipType",
+                             "stripeSubscriptionStatus")
+        token = (kv.get("accessToken") or "").strip()
+        if not token:
+            out["detail"] = "未找到 Cursor 凭证(请先登录 Cursor)"
+            return out
+
+        membership = (kv.get("stripeMembershipType") or "").strip()
+        if membership:
+            out["plan"] = membership.capitalize()
+        sub_status = (kv.get("stripeSubscriptionStatus") or "").strip()
+        if sub_status and sub_status != "active":
+            out["plan"] += f" · {sub_status}"
+
+        # 本地预检 JWT 有效期,过期就不必发请求了(打开一次 Cursor 即会自动轮换)
+        exp = _cursor_jwt_exp(token)
+        if exp and exp < _now():
+            out["detail"] = "token 已过期(请打开一次 Cursor 刷新登录)"
+            return out
+
+        import urllib.request, urllib.error
+        req = urllib.request.Request(
+            "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
+            data=b"{}", method="POST",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            })
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                out["detail"] = "token 失效(请打开一次 Cursor 刷新登录)"
+            else:
+                out["detail"] = f"HTTP {e.code}"
+            return out
+        except urllib.error.URLError:
+            out["detail"] = "网络波动"
+            return out
+
+        metrics = []
+        # 主指标: Included Usage(套餐内额度,单位是美分)
+        plan_usage = data.get("planUsage") or {}
+        total_spend = float(plan_usage.get("totalSpend") or 0)
+        limit = float(plan_usage.get("limit") or 0)
+        cycle_end = float(data.get("billingCycleEnd") or 0) / 1000
+        if limit > 0:
+            metrics.append({
+                "label": f"Included ${limit / 100:g}",
+                "used_pct": round(total_spend / limit * 100, 1),
+                "reset": _human_reset(cycle_end),
+            })
+        # 副指标: 按需消费(超额部分),开了上限才显示
+        slu = data.get("spendLimitUsage") or {}
+        ind_limit = float(slu.get("individualLimit") or 0)
+        if ind_limit > 0:
+            ind_used = ind_limit - float(slu.get("individualRemaining") or 0)
+            metrics.append({
+                "label": "按需消费",
+                "text": f"${ind_used / 100:.2f} / ${ind_limit / 100:.2f}",
+            })
+
+        if not metrics:
+            out["detail"] = "无可用指标(可能未开启用量统计)"
+            return out
+        out["metrics"] = metrics
+        out["status"] = "ok"
+        out["detail"] = "实时"
+    except Exception as e:
+        out["detail"] = f"{type(e).__name__}"
+    return out
+
+
+def probe_cursor() -> dict:
+    """Cursor Pro 用量,带 5 分钟轻缓存(同 Codex 层1)。
+    强制刷新(展开面板)时跳过缓存。"""
+    forced = os.environ.get("NOTCHQUOTA_FORCE") == "1"
+    if not forced:
+        try:
+            if os.path.exists(_CURSOR_CACHE):
+                age = _now() - os.path.getmtime(_CURSOR_CACHE)
+                if age < _CURSOR_TTL:
+                    d = json.load(open(_CURSOR_CACHE))
+                    if d.get("status") == "ok":
+                        d["detail"] = f"缓存{int(age/60)}m"
+                        return d
+        except Exception:
+            pass
+
+    result = _probe_cursor_fresh()
+    if result.get("status") == "ok":
+        try:
+            os.makedirs(os.path.dirname(_CURSOR_CACHE), exist_ok=True)
+            json.dump(result, open(_CURSOR_CACHE, "w"), ensure_ascii=False)
+        except Exception:
+            pass
+    return result
+
+
 def main():
     result = [probe_codex(), probe_claude(), probe_hermes(), probe_kimi(),
-              probe_antigravity(), probe_deepseek(), probe_opencode_go()]
+              probe_antigravity(), probe_deepseek(), probe_opencode_go(),
+              probe_cursor()]
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
