@@ -1022,7 +1022,7 @@ def probe_opencode_go() -> dict:
 
 # ─────────────────────── Cursor ───────────────────────
 # Cursor Pro 用量:从 Cursor 客户端本地存储(state.vscdb)读 accessToken,
-# 调 DashboardService/GetCurrentPeriodUsage 取当前账单周期的 Included Usage。
+# 调 DashboardService/GetCurrentPeriodUsage 取当前账单周期的分项配额与按需消费。
 # token 由 Cursor 客户端自动轮换并写回 vscdb,probe 每次运行重读即可,零配置。
 # 该接口是 Cursor 客户端自己状态栏/设置页在用的,调用频率风险低,5 分钟轻缓存即可。
 
@@ -1030,6 +1030,9 @@ _CURSOR_DB = os.path.join(HOME, "Library", "Application Support", "Cursor",
                           "User", "globalStorage", "state.vscdb")
 _CURSOR_CACHE = os.path.join(HOME, ".cache", "notchquota_cursor.json")
 _CURSOR_TTL = 300          # 层1: 轻缓存 5 分钟(同 Codex)
+_CURSOR_CACHE_VERSION = 3
+_CURSOR_SPENDING_URL = "https://cursor.com/dashboard/spending"
+_CURSOR_API_BASE = "https://api2.cursor.sh/aiserver.v1.DashboardService/"
 
 
 def _cursor_read_kv(*keys: str) -> dict:
@@ -1074,12 +1077,61 @@ def _cursor_jwt_exp(token: str) -> float:
         return 0
 
 
+def _cursor_metrics_from_usage(data: dict) -> list:
+    """把 Cursor spending 页使用的分项字段转换为统一指标。
+
+    planUsage.totalSpend / limit 是旧版金额口径，受赠送额度与不同模型桶影响，
+    并不等于当前 spending 页的配额进度。页面实际分别展示
+    autoPercentUsed(Cursor Models) 与 apiPercentUsed(Other Models)。
+    """
+    metrics = []
+    plan_usage = data.get("planUsage") or {}
+    try:
+        cycle_end = float(data.get("billingCycleEnd") or 0) / 1000
+    except (TypeError, ValueError):
+        cycle_end = 0
+    reset = _human_reset(cycle_end)
+
+    for label, field in (("Cursor 模型", "autoPercentUsed"),
+                         ("其他模型", "apiPercentUsed")):
+        value = plan_usage.get(field)
+        if value is None:
+            continue
+        try:
+            used_pct = max(0.0, float(value))
+        except (TypeError, ValueError):
+            continue
+        metric = {"label": label, "used_pct": round(used_pct, 1)}
+        if reset:
+            metric["reset"] = reset
+        metrics.append(metric)
+
+    # 按需消费是独立的付费上限，不能与上面的套餐配额合并。
+    spend_limit_usage = data.get("spendLimitUsage") or {}
+    try:
+        individual_limit = max(0.0, float(
+            spend_limit_usage.get("individualLimit") or 0))
+        individual_remaining = max(0.0, float(
+            spend_limit_usage.get("individualRemaining") or 0))
+    except (TypeError, ValueError):
+        individual_limit = 0
+        individual_remaining = 0
+    if individual_limit > 0:
+        individual_used = min(individual_limit,
+                              max(0.0, individual_limit - individual_remaining))
+        metrics.append({
+            "label": "按需消费",
+            "text": f"${individual_used / 100:.2f} / ${individual_limit / 100:.2f}",
+        })
+    return metrics
+
+
 def _probe_cursor_fresh() -> dict:
     """实际调 Cursor 后端取实时用量(无门控)。"""
     out = {
         "id": "cursor", "name": "Cursor", "plan": "Cursor",
         "status": "error", "detail": "", "metrics": [],
-        "url": "https://cursor.com/settings",
+        "url": _CURSOR_SPENDING_URL,
     }
     try:
         kv = _cursor_read_kv("accessToken", "stripeMembershipType",
@@ -1104,7 +1156,7 @@ def _probe_cursor_fresh() -> dict:
 
         import urllib.request, urllib.error
         req = urllib.request.Request(
-            "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
+            _CURSOR_API_BASE + "GetCurrentPeriodUsage",
             data=b"{}", method="POST",
             headers={
                 "Authorization": f"Bearer {token}",
@@ -1124,27 +1176,7 @@ def _probe_cursor_fresh() -> dict:
             out["detail"] = "网络波动"
             return out
 
-        metrics = []
-        # 主指标: Included Usage(套餐内额度,单位是美分)
-        plan_usage = data.get("planUsage") or {}
-        total_spend = float(plan_usage.get("totalSpend") or 0)
-        limit = float(plan_usage.get("limit") or 0)
-        cycle_end = float(data.get("billingCycleEnd") or 0) / 1000
-        if limit > 0:
-            metrics.append({
-                "label": f"Included ${limit / 100:g}",
-                "used_pct": round(total_spend / limit * 100, 1),
-                "reset": _human_reset(cycle_end),
-            })
-        # 副指标: 按需消费(超额部分),开了上限才显示
-        slu = data.get("spendLimitUsage") or {}
-        ind_limit = float(slu.get("individualLimit") or 0)
-        if ind_limit > 0:
-            ind_used = ind_limit - float(slu.get("individualRemaining") or 0)
-            metrics.append({
-                "label": "按需消费",
-                "text": f"${ind_used / 100:.2f} / ${ind_limit / 100:.2f}",
-            })
+        metrics = _cursor_metrics_from_usage(data)
 
         if not metrics:
             out["detail"] = "无可用指标(可能未开启用量统计)"
@@ -1166,8 +1198,12 @@ def probe_cursor() -> dict:
             if os.path.exists(_CURSOR_CACHE):
                 age = _now() - os.path.getmtime(_CURSOR_CACHE)
                 if age < _CURSOR_TTL:
-                    d = json.load(open(_CURSOR_CACHE))
-                    if d.get("status") == "ok":
+                    with open(_CURSOR_CACHE) as cache_file:
+                        d = json.load(cache_file)
+                    # 显式版本避免升级后短暂复用旧金额口径或缺少新增指标。
+                    if (d.get("status") == "ok" and
+                            d.get("_cache_version") == _CURSOR_CACHE_VERSION):
+                        d.pop("_cache_version", None)
                         d["detail"] = f"缓存{int(age/60)}m"
                         return d
         except Exception:
@@ -1177,7 +1213,10 @@ def probe_cursor() -> dict:
     if result.get("status") == "ok":
         try:
             os.makedirs(os.path.dirname(_CURSOR_CACHE), exist_ok=True)
-            json.dump(result, open(_CURSOR_CACHE, "w"), ensure_ascii=False)
+            cached = dict(result)
+            cached["_cache_version"] = _CURSOR_CACHE_VERSION
+            with open(_CURSOR_CACHE, "w") as cache_file:
+                json.dump(cached, cache_file, ensure_ascii=False)
         except Exception:
             pass
     return result

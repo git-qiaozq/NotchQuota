@@ -1,6 +1,6 @@
 # NotchQuota
 
-在 MacBook 刘海处实时查看 **Codex / Claude / Z.AI / Kimi / Antigravity / DeepSeek / OpenCode Go** 的套餐用量与账户余额。
+在 MacBook 刘海处实时查看 **Codex / Claude / Z.AI / Kimi / Antigravity / DeepSeek / OpenCode Go / Cursor** 的套餐用量与账户余额。
 
 鼠标划过刘海 → 面板像 Dynamic Island 一样从刘海胀开包裹刘海，展示各家用量；鼠标移开即收回。
 
@@ -14,9 +14,9 @@
 | **Antigravity** | 两模型组(Gemini / Claude&GPT)×(5h/周) 已用百分比 | `agy` CLI 的 `/usage` (常驻 daemon 复用会话) |
 | **DeepSeek** | 账户余额(充值/赠送构成) | `api.deepseek.com/user/balance` 实时 API |
 | **OpenCode Go** | 5h/周/月 用量百分比 + 重置倒计时 | 网页抓取 `opencode.ai/workspace/{id}/go` |
-| **OpenCode Go** | 5h/周/月 用量百分比 + 重置倒计时 | 网页抓取 `opencode.ai/workspace/{id}/go` (auth cookie) |
+| **Cursor** | Cursor Models / Other Models + 按需消费 | `DashboardService/GetCurrentPeriodUsage` 实时 API |
 
-- 六家**全部实时**，每 60 秒自动刷新；展开面板时按需强制刷新
+- 各平台数据每 60 秒自动刷新；展开面板时按需强制刷新
 - 点击卡片跳转到对应平台的用量详情页
 - 完整生命周期：应用图标、设置窗口、开机自启开关、完全退出（退出时优雅关闭 daemon）
 
