@@ -2,6 +2,20 @@ import Foundation
 
 extension Notification.Name {
     static let quotaCardVisibilityDidChange = Notification.Name("quotaCardVisibilityDidChange")
+    static let quotaTriggerModeDidChange = Notification.Name("quotaTriggerModeDidChange")
+}
+
+// 面板触发方式:刘海悬停,或屏幕右上角触发(类触发角)
+enum QuotaTriggerMode: String {
+    case notch
+    case topRightCorner
+
+    var displayName: String {
+        switch self {
+        case .notch: return "刘海悬停"
+        case .topRightCorner: return "右上角触发"
+        }
+    }
 }
 
 struct QuotaCardOption {
@@ -23,6 +37,18 @@ enum QuotaDisplayPreferences {
 
     private static let hiddenCardIDsKey = "hiddenQuotaCardIDs"
     private static let cardOrderKey = "quotaCardOrder"
+    private static let triggerModeKey = "quotaTriggerMode"
+
+    static var triggerMode: QuotaTriggerMode {
+        get {
+            QuotaTriggerMode(rawValue: UserDefaults.standard.string(forKey: triggerModeKey) ?? "") ?? .notch
+        }
+        set {
+            guard newValue != triggerMode else { return }
+            UserDefaults.standard.set(newValue.rawValue, forKey: triggerModeKey)
+            NotificationCenter.default.post(name: .quotaTriggerModeDidChange, object: nil)
+        }
+    }
 
     static var hiddenCardIDs: Set<String> {
         get {

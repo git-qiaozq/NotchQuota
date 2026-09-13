@@ -4,7 +4,13 @@ import AppKit
 final class PanelView: NSView {
     private let stack = NSStackView()
     private var onClickURL: ((String) -> Void)?
-    private let notchInset: CGFloat   // 顶部留给刘海融合的空白高度
+    // 顶部留给刘海融合的空白高度;右上角触发模式下为 0
+    var notchInset: CGFloat {
+        didSet {
+            stack.edgeInsets = NSEdgeInsets(top: notchInset + 14,
+                                            left: 16, bottom: 16, right: 16)
+        }
+    }
 
     init(onClickURL: @escaping (String) -> Void, notchInset: CGFloat = 0) {
         self.onClickURL = onClickURL
