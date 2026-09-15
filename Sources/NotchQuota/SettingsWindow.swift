@@ -1,7 +1,7 @@
 import AppKit
 import ServiceManagement
 
-// 设置窗口:开机自启开关 + 卡片显示开关 + 完全退出按钮
+// 设置窗口:左侧品牌区(图标/名称/版本/退出),右侧设置列表(自启/触发方式/卡片选择)
 // 关窗口不会退出 app(刘海功能继续运行),只有点"完全退出"才终止进程
 final class SettingsWindowController: NSObject, NSWindowDelegate {
 
@@ -9,14 +9,17 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private var window: NSWindow?
     private var launchSwitch: NSSwitch?
 
+    // 上次生效的自启注册结果(持久化):据此判断"开关意图"与"系统真状态"是否被外部改过
+    private static let launchSyncedKey = "launchAtLoginSyncedState"
+
     func show() {
         if let w = window {
             w.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
         }
-        // 固定合理的窗口尺寸(经过布局计算,比例协调)
-        let W: CGFloat = 380, H: CGFloat = 752
+        // 左右分栏:不再纵向堆叠,内容多时高度可控
+        let W: CGFloat = 620, H: CGFloat = 436
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: W, height: H),
                          styleMask: [.titled, .closable],
                          backing: .buffered, defer: false)
@@ -35,175 +38,148 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         root.wantsLayer = true
         root.layer?.backgroundColor = bg.cgColor
 
-        // ════════ 用 frame 精确定位每个元素(不用 Auto Layout,避免 fittingSize 不确定) ════════
-        // 坐标系:root 左下角为原点,y 向上
+        // ════════ 左栏:品牌区 ════════
+        let sideW: CGFloat = 196
+        let sidebar = NSView(frame: NSRect(x: 0, y: 0, width: sideW, height: H))
+        sidebar.wantsLayer = true
+        sidebar.layer?.backgroundColor = NSColor(white: 1, alpha: 0.03).cgColor
 
-        // ── 头部:图标 + 名称 + 副标题(顶部 36pt 起) ──
-        let iconSize: CGFloat = 88
+        let iconSize: CGFloat = 72
         let icon = NSImageView(image: NSApp.applicationIconImage)
         icon.imageScaling = .scaleProportionallyUpOrDown
-        icon.frame = NSRect(x: (W - iconSize) / 2, y: H - 36 - iconSize,
+        icon.frame = NSRect(x: (sideW - iconSize) / 2, y: H - 48 - iconSize,
                             width: iconSize, height: iconSize)
 
         let nameLbl = NSTextField(labelWithString: "NotchQuota")
-        nameLbl.font = .systemFont(ofSize: 20, weight: .semibold)
+        nameLbl.font = .systemFont(ofSize: 17, weight: .semibold)
         nameLbl.textColor = .white
         nameLbl.alignment = .center
         nameLbl.sizeToFit()
-        nameLbl.frame.origin = NSPoint(x: (W - nameLbl.frame.width) / 2,
-                                       y: icon.frame.minY - 28)
+        nameLbl.frame.origin = NSPoint(x: (sideW - nameLbl.frame.width) / 2,
+                                       y: icon.frame.minY - 26)
 
         let subLbl = NSTextField(labelWithString: "刘海用量监控")
-        subLbl.font = .systemFont(ofSize: 12)
+        subLbl.font = .systemFont(ofSize: 11)
         subLbl.textColor = NSColor(white: 0.6, alpha: 1)
         subLbl.alignment = .center
         subLbl.sizeToFit()
-        subLbl.frame.origin = NSPoint(x: (W - subLbl.frame.width) / 2,
-                                      y: nameLbl.frame.minY - 20)
+        subLbl.frame.origin = NSPoint(x: (sideW - subLbl.frame.width) / 2,
+                                      y: nameLbl.frame.minY - 18)
 
-        // ── 卡片通用绘制函数 ──
-        let cardInset: CGFloat = 28
-        let cardW = W - cardInset * 2
-        func makeCard(y: CGFloat, h: CGFloat) -> NSView {
-            let v = NSView(frame: NSRect(x: cardInset, y: y, width: cardW, height: h))
+        // ── 完全退出:品牌区底部 ──
+        let quitW: CGFloat = sideW - 32
+        let quitBtn = HoverQuitButton(titleText: "完全退出", width: quitW,
+                                      target: self, action: #selector(quitApp))
+        quitBtn.frame.origin = NSPoint(x: 16, y: 34)
+
+        let quitHint = NSTextField(labelWithString: "退出后停止监控,可再次点击图标启动")
+        quitHint.font = .systemFont(ofSize: 9)
+        quitHint.textColor = NSColor(white: 0.42, alpha: 1)
+        quitHint.alignment = .center
+        quitHint.sizeToFit()
+        quitHint.frame = NSRect(x: 0, y: 18, width: sideW, height: quitHint.frame.height)
+
+        let versionLbl = NSTextField(labelWithString: "v0.1")
+        versionLbl.font = .systemFont(ofSize: 10)
+        versionLbl.textColor = NSColor(white: 0.38, alpha: 1)
+        versionLbl.alignment = .center
+        versionLbl.sizeToFit()
+        versionLbl.frame = NSRect(x: 0, y: 2, width: sideW, height: versionLbl.frame.height)
+
+        [icon, nameLbl, subLbl, quitBtn, quitHint, versionLbl].forEach { sidebar.addSubview($0) }
+
+        // ── 分隔线 ──
+        let sep = NSView(frame: NSRect(x: sideW, y: 0, width: 1, height: H))
+        sep.wantsLayer = true
+        sep.layer?.backgroundColor = NSColor(white: 1, alpha: 0.07).cgColor
+
+        // ════════ 右栏:设置列表 ════════
+        let contentX = sideW + 1
+        let contentW = W - contentX
+        let pad: CGFloat = 20
+        let rowW = contentW - pad * 2
+
+        // ── 卡片选择:标题 + 列表(列表占满剩余高度,滚动自然) ──
+        let visibleTitle = NSTextField(labelWithString: "显示卡片")
+        visibleTitle.font = .systemFont(ofSize: 13, weight: .semibold)
+        visibleTitle.textColor = .white
+        visibleTitle.sizeToFit()
+        visibleTitle.frame.origin = NSPoint(x: contentX + pad + 2, y: H - 36)
+
+        let visibleHint = NSTextField(labelWithString: "选择刘海面板里展示的服务,拖动排序")
+        visibleHint.font = .systemFont(ofSize: 10)
+        visibleHint.textColor = NSColor(white: 0.48, alpha: 1)
+        visibleHint.sizeToFit()
+        visibleHint.frame.origin = NSPoint(x: contentX + pad + 2, y: H - 52)
+
+        let topRowH: CGFloat = 60
+        let listY = pad + topRowH * 2 + 14 * 2 + 10
+        let listH = visibleHint.frame.minY - 10 - listY
+        let scroll = NSScrollView(frame: NSRect(x: contentX + pad, y: listY, width: rowW, height: listH))
+        scroll.hasVerticalScroller = true
+        scroll.scrollerStyle = .overlay
+        scroll.drawsBackground = false
+        scroll.borderType = .noBorder
+        scroll.autohidesScrollers = true
+        let cardList = CardOrderListView(frame: NSRect(x: 0, y: 0, width: rowW, height: listH))
+        scroll.documentView = cardList
+
+        // ── 行容器:统一的分组行样式 ──
+        func makeRow(y: CGFloat) -> NSView {
+            let v = NSView(frame: NSRect(x: contentX + pad, y: y, width: rowW, height: topRowH))
             v.wantsLayer = true
-            v.layer?.backgroundColor = NSColor(white: 1, alpha: 0.06).cgColor
-            v.layer?.cornerRadius = 14
-            v.layer?.borderColor = NSColor(white: 1, alpha: 0.08).cgColor
+            v.layer?.backgroundColor = NSColor(white: 1, alpha: 0.05).cgColor
+            v.layer?.cornerRadius = 12
+            v.layer?.borderColor = NSColor(white: 1, alpha: 0.07).cgColor
             v.layer?.borderWidth = 0.5
             return v
         }
 
-        // ── 通用卡片 ──
-        let launchH: CGFloat = 72
-        let launchY = subLbl.frame.minY - 30 - launchH
-        let launchCard = makeCard(y: launchY, h: launchH)
+        func rowMainLabel(_ text: String) -> NSTextField {
+            let l = NSTextField(labelWithString: text)
+            l.font = .systemFont(ofSize: 13, weight: .medium)
+            l.textColor = .white
+            l.sizeToFit()
+            l.frame.origin = NSPoint(x: 14, y: 29)
+            return l
+        }
 
-        let launchTitle = NSTextField(labelWithString: "通用")
-        launchTitle.font = .systemFont(ofSize: 10, weight: .semibold)
-        launchTitle.textColor = NSColor(white: 0.45, alpha: 1)
-        launchTitle.sizeToFit()
-        launchTitle.frame.origin = NSPoint(x: 16, y: launchH - 26)
+        func rowHintLabel(_ text: String) -> NSTextField {
+            let l = NSTextField(labelWithString: text)
+            l.font = .systemFont(ofSize: 10)
+            l.textColor = NSColor(white: 0.48, alpha: 1)
+            l.sizeToFit()
+            l.frame.origin = NSPoint(x: 14, y: 11)
+            return l
+        }
 
-        let mainLbl = NSTextField(labelWithString: "开机时自动启动")
-        mainLbl.font = .systemFont(ofSize: 14, weight: .medium)
-        mainLbl.textColor = .white
-        mainLbl.sizeToFit()
-        mainLbl.frame.origin = NSPoint(x: 16, y: 22)
-
-        let hintLbl = NSTextField(labelWithString: "登录后自动常驻")
-        hintLbl.font = .systemFont(ofSize: 11)
-        hintLbl.textColor = NSColor(white: 0.5, alpha: 1)
-        hintLbl.sizeToFit()
-        hintLbl.frame.origin = NSPoint(x: 16, y: 6)
-
+        // ── 开机自启行 ──
+        let launchY = pad + topRowH + 14
+        let launchRow = makeRow(y: launchY)
+        let launchMain = rowMainLabel("开机时自动启动")
+        let launchHint = rowHintLabel("登录后自动常驻")
         let sw = NSSwitch()
         sw.target = self
         sw.action = #selector(toggleLaunchAtLogin)
-        sw.state = launchAtLoginEnabled() ? .on : .off
+        launchSwitch = sw
         sw.sizeToFit()
-        sw.frame.origin = NSPoint(x: cardW - sw.frame.width - 16, y: 22)
-        self.launchSwitch = sw
+        sw.frame.origin = NSPoint(x: rowW - sw.frame.width - 14,
+                                  y: (topRowH - sw.frame.height) / 2)
+        syncLaunchSwitch()
+        [launchMain, launchHint, sw].forEach { launchRow.addSubview($0) }
 
-        [launchTitle, mainLbl, hintLbl, sw].forEach { launchCard.addSubview($0) }
-
-        // ── 触发方式卡片 ──
-        let triggerH: CGFloat = 72
-        let triggerY = launchY - 16 - triggerH
-        let triggerCard = makeCard(y: triggerY, h: triggerH)
-
-        let triggerTitle = NSTextField(labelWithString: "触发方式")
-        triggerTitle.font = .systemFont(ofSize: 10, weight: .semibold)
-        triggerTitle.textColor = NSColor(white: 0.45, alpha: 1)
-        triggerTitle.sizeToFit()
-        triggerTitle.frame.origin = NSPoint(x: 16, y: triggerH - 26)
-
-        let triggerMainLbl = NSTextField(labelWithString: "弹出位置")
-        triggerMainLbl.font = .systemFont(ofSize: 14, weight: .medium)
-        triggerMainLbl.textColor = .white
-        triggerMainLbl.sizeToFit()
-        triggerMainLbl.frame.origin = NSPoint(x: 16, y: 22)
-
-        let triggerHintLbl = NSTextField(labelWithString: "悬停刘海,或划入屏幕右上角")
-        triggerHintLbl.font = .systemFont(ofSize: 11)
-        triggerHintLbl.textColor = NSColor(white: 0.5, alpha: 1)
-        triggerHintLbl.sizeToFit()
-        triggerHintLbl.frame.origin = NSPoint(x: 16, y: 6)
-
-        let modeSwitch = TriggerModeSwitch(frame: NSRect(x: 0, y: 0, width: 198, height: 30))
+        // ── 触发方式行 ──
+        let triggerRow = makeRow(y: pad)
+        let triggerMain = rowMainLabel("弹出位置")
+        let triggerHint = rowHintLabel("悬停刘海,或划入屏幕右上角")
+        let modeSwitch = TriggerModeSwitch(frame: NSRect(x: 0, y: 0, width: 196, height: 28))
         modeSwitch.setMode(QuotaDisplayPreferences.triggerMode, animated: false)
         modeSwitch.onChange = { QuotaDisplayPreferences.triggerMode = $0 }
-        modeSwitch.frame.origin = NSPoint(x: cardW - modeSwitch.frame.width - 14,
-                                          y: (triggerH - modeSwitch.frame.height) / 2)
+        modeSwitch.frame.origin = NSPoint(x: rowW - modeSwitch.frame.width - 12,
+                                          y: (topRowH - modeSwitch.frame.height) / 2)
+        [triggerMain, triggerHint, modeSwitch].forEach { triggerRow.addSubview($0) }
 
-        [triggerTitle, triggerMainLbl, triggerHintLbl, modeSwitch].forEach { triggerCard.addSubview($0) }
-
-        // ── 显示卡片 ──
-        // 列表区域加高到 5 行可见(156),并用 ScrollView 包裹:
-        // 未来再加服务时直接滚动,不再被裁掉
-        let visibleH: CGFloat = 220
-        let visibleY = triggerY - 16 - visibleH
-        let visibleCard = makeCard(y: visibleY, h: visibleH)
-
-        let visibleTitle = NSTextField(labelWithString: "显示卡片")
-        visibleTitle.font = .systemFont(ofSize: 10, weight: .semibold)
-        visibleTitle.textColor = NSColor(white: 0.45, alpha: 1)
-        visibleTitle.sizeToFit()
-        visibleTitle.frame.origin = NSPoint(x: 16, y: visibleH - 26)
-        visibleCard.addSubview(visibleTitle)
-
-        let visibleHint = NSTextField(labelWithString: "选择刘海面板里展示的服务")
-        visibleHint.font = .systemFont(ofSize: 11)
-        visibleHint.textColor = NSColor(white: 0.5, alpha: 1)
-        visibleHint.sizeToFit()
-        visibleHint.frame.origin = NSPoint(x: 16, y: visibleH - 45)
-        visibleCard.addSubview(visibleHint)
-
-        // ScrollView 包住列表,行数超出可视高度时可滚动
-        let listAreaH: CGFloat = 156   // (28+3)*5 + 1,5 行刚好全可见
-        let scroll = NSScrollView(frame: NSRect(x: 12, y: 12, width: cardW - 24, height: listAreaH))
-        scroll.hasVerticalScroller = true
-        scroll.scrollerStyle = .overlay
-        scroll.drawsBackground = false
-        scroll.autohidesScrollers = false   // 常驻滚动条:6 张卡后有内容在下方,提示可滚动
-        let cardList = CardOrderListView(frame: NSRect(x: 0, y: 0, width: cardW - 24, height: listAreaH))
-        scroll.documentView = cardList
-        visibleCard.addSubview(scroll)
-
-        // ── 退出卡片 ──
-        let quitH: CGFloat = 96
-        let quitY = max(34, visibleY - 16 - quitH)
-        let quitCard = makeCard(y: quitY, h: quitH)
-
-        let quitTitle = NSTextField(labelWithString: "操作")
-        quitTitle.font = .systemFont(ofSize: 10, weight: .semibold)
-        quitTitle.textColor = NSColor(white: 0.45, alpha: 1)
-        quitTitle.sizeToFit()
-        quitTitle.frame.origin = NSPoint(x: 16, y: quitH - 26)
-
-        let quitBtn = HoverQuitButton(titleText: "完全退出 NotchQuota",
-                                      target: self, action: #selector(quitApp))
-        quitBtn.setFrameSize(NSSize(width: 176, height: 30))
-        quitBtn.frame.origin = NSPoint(x: (cardW - quitBtn.frame.width) / 2, y: 31)
-
-        let quitHint = NSTextField(labelWithString: "退出后停止监控,可再次点击图标启动")
-        quitHint.font = .systemFont(ofSize: 11)
-        quitHint.textColor = NSColor(white: 0.5, alpha: 1)
-        quitHint.sizeToFit()
-        quitHint.frame.origin = NSPoint(x: (cardW - quitHint.frame.width) / 2, y: 12)
-
-        [quitTitle, quitBtn, quitHint].forEach { quitCard.addSubview($0) }
-
-        // ── 版本号 ──
-        let versionLbl = NSTextField(labelWithString: "v0.1")
-        versionLbl.font = .systemFont(ofSize: 10)
-        versionLbl.textColor = NSColor(white: 0.4, alpha: 1)
-        versionLbl.sizeToFit()
-        versionLbl.frame.origin = NSPoint(x: (W - versionLbl.frame.width) / 2, y: 10)
-
-        for v in [icon, nameLbl, subLbl, launchCard, triggerCard, visibleCard, quitCard, versionLbl] {
-            root.addSubview(v)
-        }
+        [sidebar, sep, scroll, visibleTitle, visibleHint, launchRow, triggerRow].forEach { root.addSubview($0) }
 
         w.contentView = root
         window = w
@@ -211,20 +187,34 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    // ── 开机自启:用 SMAppService(macOS 13+) ──
-    private func launchAtLoginEnabled() -> Bool {
-        SMAppService.mainApp.status == .enabled
+    // ── 开机自启 ──
+    // 开关状态以"上次注册意图"(持久化)为准,与系统真状态不一致时纠正一次(用户在系统设置里改过)
+    private func syncLaunchSwitch() {
+        let enabled = SMAppService.mainApp.status == .enabled
+        let synced = UserDefaults.standard.object(forKey: Self.launchSyncedKey) as? Bool
+        let intended = synced ?? enabled
+        if synced != nil, enabled != intended {
+            reapplyLaunchAtLogin(intended)
+        }
+        launchSwitch?.state = intended ? .on : .off
     }
-    @objc private func toggleLaunchAtLogin() {
-        let enabled = launchAtLoginEnabled()
+
+    private func reapplyLaunchAtLogin(_ enable: Bool) {
         do {
-            if enabled {
-                try SMAppService.mainApp.unregister()
-            } else {
-                try SMAppService.mainApp.register()
-            }
+            if enable { try SMAppService.mainApp.register() }
+            else { try SMAppService.mainApp.unregister() }
+        } catch { /* 纠正失败静默,下次打开窗口再试 */ }
+    }
+
+    @objc private func toggleLaunchAtLogin() {
+        guard let sw = launchSwitch else { return }
+        let wantOn = sw.state == .on
+        do {
+            if wantOn { try SMAppService.mainApp.register() }
+            else { try SMAppService.mainApp.unregister() }
+            UserDefaults.standard.set(wantOn, forKey: Self.launchSyncedKey)
         } catch {
-            launchSwitch?.state = enabled ? .on : .off
+            sw.state = wantOn ? .off : .on
             NSSound.beep()
         }
     }
@@ -691,18 +681,11 @@ final class HoverQuitButton: NSView {
     private let red = NSColor.systemRed
     private let stripeSpacing: CGFloat = 14
 
-    init(titleText: String, target: Any?, action: Selector?) {
+    init(titleText: String, width: CGFloat, target: Any?, action: Selector?) {
         self.titleText = titleText
         self.target = target as AnyObject?
         self.action = action
-        super.init(frame: .zero)
-        wantsLayer = true
-        setupLayers()
-    }
-
-    override init(frame frameRect: NSRect) {
-        self.titleText = ""
-        super.init(frame: frameRect)
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: 30))
         wantsLayer = true
         setupLayers()
     }
