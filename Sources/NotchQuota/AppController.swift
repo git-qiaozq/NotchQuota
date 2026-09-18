@@ -16,7 +16,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var isRefreshing = false
     private var isOpen = false
     private var openedInCornerMode = false   // 本次展开使用的触发方式(决定收起动画形态)
-    private var radiateGeneration = 0        // 辐射动画代次:使过期的动画完成回调失效
+    private var animationGeneration = 0      // 展开/收起共用代次,防止旧回调隐藏重新打开的面板
     private var closeWorkItem: DispatchWorkItem?   // 延迟收起任务
     private var notchHotRect: NSRect = .zero        // 收起态刘海热区矩形
     private var currentTargetFrame: NSRect?         // 展开后面板目标矩形
@@ -167,7 +167,8 @@ final class AppController: NSObject, NSApplicationDelegate {
         hotZone.isOpaque = false
         hotZone.hasShadow = false
         hotZone.ignoresMouseEvents = false
-        hotZone.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        // transient 在调度中心隐藏;stationary 会保留窗口参与显示。
+        hotZone.collectionBehavior = [.canJoinAllSpaces, .transient, .fullScreenAuxiliary, .ignoresCycle]
 
         let hv = HoverView(frame: hotZone.contentView!.bounds)
         hv.autoresizingMask = [.width, .height]
@@ -177,7 +178,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         hotZone.orderFrontRegardless()
     }
 
-    // ── 面板:初始藏在屏幕顶外 ──
+    // ── 面板:初始不加入显示列表,屏幕外坐标只用于展开/收起动画 ──
     private func setupPanel(screen: NSScreen) {
         let sf = screen.frame
         let g = notchGeom(screen)
@@ -199,7 +200,8 @@ final class AppController: NSObject, NSApplicationDelegate {
             cl.shadowRadius = 12
             cl.shadowOffset = NSSize(width: 0, height: -4)
         }
-        panelWindow.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        panelWindow.collectionBehavior = [.canJoinAllSpaces, .transient, .fullScreenAuxiliary, .ignoresCycle]
+        panelWindow.animationBehavior = .none   // 显隐由自定义动画负责,orderOut 不再追加系统动画
 
         // notchInset = 刘海高度 → 顶部留出刘海融合区,内容沉到刘海底边以下
         panelView = PanelView(
@@ -217,16 +219,16 @@ final class AppController: NSObject, NSApplicationDelegate {
         container.addSubview(panelView)
         panelWindow.contentView = container
         panelWindow.alphaValue = 1
-        panelWindow.orderFrontRegardless()
         debugLog("SETUP screen.frame=\(screen.frame) visibleFrame=\(screen.visibleFrame) notch=\(g.left),\(g.right) h=\(g.height) panelW=\(panelWidth)")
     }
 
     // ── 展开:面板顶部顶到屏幕顶(包裹刘海),从顶外下滑 ──
     private func openPanel() {
         cancelClose()
-        guard !isOpen else { return }
+        guard !isOpen, let screen = NSScreen.main else { return }
         isOpen = true
-        guard let screen = NSScreen.main else { return }
+        animationGeneration += 1
+        let gen = animationGeneration
         let sf = screen.frame
         let g = notchGeom(screen)
 
@@ -259,11 +261,13 @@ final class AppController: NSObject, NSApplicationDelegate {
                                width: panelWidth, height: totalH)
             panelWindow.setFrame(start, display: false)
             resetRadiateState()   // 清掉可能未完成的角落动画残留
+            panelWindow.orderFrontRegardless()
             NSAnimationContext.runAnimationGroup({ ctx in
                 ctx.duration = 0.32
                 ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
                 panelWindow.animator().setFrame(target, display: true)
-            }, completionHandler: {
+            }, completionHandler: { [weak self] in
+                guard let self = self, self.isOpen, gen == self.animationGeneration else { return }
                 self.debugLog("OPENED actualFrame=\(self.panelWindow.frame) topY=\(self.panelWindow.frame.maxY)")
                 self.startPolling()   // 展开完成后启动兜底轮询
             })
@@ -274,9 +278,14 @@ final class AppController: NSObject, NSApplicationDelegate {
     private func closePanel() {
         guard isOpen else { return }
         isOpen = false
+        animationGeneration += 1
+        let gen = animationGeneration
         currentTargetFrame = nil
         stopPolling()   // 收起后停止轮询
-        guard let screen = NSScreen.main else { return }
+        guard let screen = NSScreen.main else {
+            panelWindow.orderOut(nil)
+            return
+        }
         let sf = screen.frame
         let cur = panelWindow.frame
         let hidden = NSRect(x: cur.origin.x, y: sf.maxY + hideInset,
@@ -284,6 +293,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         if openedInCornerMode {
             // 缩回右上角 + 淡出(显式动画:AppKit 的 layer-backed 视图不支持隐式动画)
             guard let layer = panelWindow.contentView?.layer else {
+                panelWindow.orderOut(nil)
                 panelWindow.setFrame(hidden, display: false)
                 return
             }
@@ -314,29 +324,33 @@ final class AppController: NSObject, NSApplicationDelegate {
             CATransaction.commit()
             layer.add(group, forKey: "radiateOut")
 
-            // 播完后藏回屏幕顶外;代次不符说明已被重新展开接管
-            // 注意:这里只移窗口,不复位内容层——若先恢复成全尺寸不透明再移窗,
-            // 两步不属同一渲染提交,会在原地闪一帧。内容层复位推迟到下次展开时
-            // (playRadiateFromCorner / 刘海路径的 resetRadiateState),那时窗口在屏幕外,不可见
-            radiateGeneration += 1
-            let gen = radiateGeneration
+            // 动画结束后真正隐藏,避免 macOS 27 把屏幕外窗口纳入空间缩略图。
+            // 代次不符说明面板已重新展开,不能再隐藏;内容层到下次展开时才复位。
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) { [weak self] in
-                guard let self = self, !self.isOpen, gen == self.radiateGeneration else { return }
+                guard let self = self, !self.isOpen, gen == self.animationGeneration else { return }
+                self.panelWindow.orderOut(nil)
                 self.panelWindow.setFrame(hidden, display: false)
             }
         } else {
-            NSAnimationContext.runAnimationGroup { ctx in
+            NSAnimationContext.runAnimationGroup({ ctx in
                 ctx.duration = 0.24
                 ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
                 panelWindow.animator().setFrame(hidden, display: true)
-            }
+            }, completionHandler: { [weak self] in
+                guard let self = self, !self.isOpen, gen == self.animationGeneration else { return }
+                self.panelWindow.orderOut(nil)
+            })
         }
     }
 
     // ── 右上角辐射动画 ──
     // 窗口直接放在目标位,只对内容层做 transform(窗口 frame 不动,活跃区判断不受影响)
     private func playRadiateFromCorner() {
-        guard let contentView = panelWindow.contentView, let layer = contentView.layer else { return }
+        guard let contentView = panelWindow.contentView, let layer = contentView.layer else {
+            panelWindow.orderFrontRegardless()
+            startPolling()
+            return
+        }
         setRadiateAnchor(atCorner: true)
         // 若是在收起动画中途重新展开,从当前展示状态接着放大,避免跳变
         let interrupted = layer.animation(forKey: "radiateOut") != nil
@@ -373,12 +387,12 @@ final class AppController: NSObject, NSApplicationDelegate {
         group.animations = [expand, fade]
         group.duration = 0.44
         layer.add(group, forKey: "radiateIn")
+        panelWindow.orderFrontRegardless()   // 首帧动画准备好后再显示,避免整块面板闪现
 
         // 动画结束后还原锚点/启动兜底轮询;代次不符说明已被更新的展开/收起接管
-        radiateGeneration += 1
-        let gen = radiateGeneration
+        let gen = animationGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.46) { [weak self] in
-            guard let self = self, self.isOpen, gen == self.radiateGeneration else { return }
+            guard let self = self, self.isOpen, gen == self.animationGeneration else { return }
             self.resetRadiateState()
             self.startPolling()
         }
