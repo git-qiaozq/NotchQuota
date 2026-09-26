@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 """
-quota_probe.py — 统一采集 Codex / Claude / Z.AI / Kimi / Antigravity / DeepSeek / OpenCode Go / Cursor 用量与余额。
+quota_probe.py — 统一采集 Codex / Claude / Z.AI / Kimi / DeepSeek / OpenCode Go / Cursor 用量与余额。
 输出一份 JSON 数组到 stdout，供 NotchQuota.app 渲染。
 
 每个采集器都用 try/except 包住：单家失败不影响其它几家，
@@ -293,85 +293,6 @@ def probe_codex() -> dict:
         _codex_record_fail()     # 失败 → 计数,触发退避
     return result
 
-
-# ───────────────────── Antigravity ─────────────────────
-# 通过驱动 agy CLI 的 /usage 命令获取真实配额(agy 自行处理 token/gRPC/license)
-# 比直调 REST API 可靠 —— 后者会因 keychain token 被 IDE 刷新丢失 Pro scope 而 403
-
-def probe_antigravity() -> dict:
-    """驱动 agy /usage,解析 TUI 输出,返回两家模型组的周/5h 限额。"""
-    out = {
-        "id": "antigravity", "name": "Antigravity", "plan": "Google One AI Pro",
-        "status": "error", "detail": "", "metrics": [],
-        "url": "https://gemini.google.com/usage",
-    }
-    import sys
-    probe_dir = os.path.dirname(os.path.abspath(__file__))
-    if probe_dir not in sys.path:
-        sys.path.insert(0, probe_dir)
-    try:
-        from agy_usage import fetch_usage
-    except ImportError:
-        out["detail"] = "agy_usage.py 缺失"
-        return out
-
-    # 展开面板时 Swift 端会设置 NOTCHQUOTA_FORCE=1。将它传给 agy daemon，
-    # 使已在终端重新登录后的后台旧会话能够立即重载 Keychain。
-    result = fetch_usage(force=os.environ.get("NOTCHQUOTA_FORCE") == "1")
-    if result.get("status") != "ok":
-        out["detail"] = result.get("detail", "未知错误")
-        return out
-
-    groups = result.get("groups", [])
-    out["status"] = "ok"
-    out["detail"] = result.get("detail", "实时")
-
-    def _fmt_reset_hours(h):
-        """小时数 → 'Xd Yh' 格式(不足1天则显示 'Xh Ym')。"""
-        if h is None:
-            return ""
-        if h >= 24:
-            d = int(h // 24)
-            rh = int(round(h - d * 24))
-            if rh >= 24:        # 四舍五入后满一天 → 进位
-                d += 1; rh -= 24
-            return f"{d}d{rh}h" if rh else f"{d}d"
-        hh = int(h)
-        mm = int(round((h - hh) * 60))
-        if mm >= 60:            # 同理,分钟满一小时 → 进位
-            hh += 1; mm -= 60
-        return f"{hh}h{mm}m" if mm else f"{hh}h"
-
-    # 每个模型组按固定顺序显示: 5h 窗口在上, 周窗口在下(和 Codex 统一)
-    # 只保留 Gemini 组,过滤掉 Claude&GPT 组
-    for g in groups:
-        if "CLAUDE" in g.get("group", "").upper():
-            continue
-        five_h = g.get("five_hour_limit", {})
-        weekly = g.get("weekly_limit", {})
-        if not five_h and not weekly:
-            continue
-        # 组名简化: GEMINI MODELS → Gemini / CLAUDE AND GPT MODELS → Claude&GPT
-        short = g["group"].replace("MODELS", "").strip()
-        if "CLAUDE" in short:
-            short = "Claude&GPT"
-        elif "GEMINI" in short:
-            short = "Gemini"
-        # 5h 窗口(直接用 agy 的原始 'Xh Ym')
-        if five_h:
-            out["metrics"].append({
-                "label": f"{short} 5h",
-                "used_pct": five_h["used_pct"],
-                "reset": five_h.get("reset", ""),
-            })
-        # 周窗口(换算成 'Xd Yh')
-        if weekly:
-            out["metrics"].append({
-                "label": f"{short} 周",
-                "used_pct": weekly["used_pct"],
-                "reset": _fmt_reset_hours(weekly.get("reset_hours")),
-            })
-    return out
 
 # ───────────────────────── Claude ─────────────────────────
 # Claude Pro 用量:用 keychain 里的 OAuth token 发一条 haiku 最小请求,
@@ -722,7 +643,7 @@ def probe_hermes() -> dict:
             elif unit == 6:
                 weekly = entry
 
-        # 固定顺序: 5h 在上、周在下(和 Codex/Antigravity 统一)
+        # 固定顺序: 5h 在上、周在下(和 Codex 统一)
         if five_h:
             metrics.append({"label": "5h 窗口", **five_h})
         if weekly:
@@ -1224,8 +1145,7 @@ def probe_cursor() -> dict:
 
 def main():
     result = [probe_codex(), probe_claude(), probe_hermes(), probe_kimi(),
-              probe_antigravity(), probe_deepseek(), probe_opencode_go(),
-              probe_cursor()]
+              probe_deepseek(), probe_opencode_go(), probe_cursor()]
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

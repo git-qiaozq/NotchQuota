@@ -52,6 +52,8 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        // 开机自启:按持久化意图纠正系统注册状态(用户在系统设置里改过时恢复)
+        debugLog("LAUNCHATLOGIN \(LaunchAtLogin.reapplyIfNeeded())")
         guard let screen = NSScreen.main else { return }
         setupHotZone(screen: screen)
         setupPanel(screen: screen)
@@ -131,11 +133,9 @@ final class AppController: NSObject, NSApplicationDelegate {
         return false
     }
 
-    // ── app 退出时优雅关闭 agy daemon,避免遗留孤儿进程 ──
-    // daemon 收到 shutdown 会终止它托管的 agy 会话并清理 socket
+    // ── app 退出时移除观察者 ──
     func applicationWillTerminate(_ notification: Notification) {
         NotificationCenter.default.removeObserver(self)
-        QuotaFetcher.shutdownDaemon()
     }
 
     // ── 热区矩形:按触发方式计算 ──

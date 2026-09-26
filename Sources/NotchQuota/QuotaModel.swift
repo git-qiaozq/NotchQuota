@@ -86,27 +86,6 @@ enum QuotaFetcher {
         }
     }
 
-    /// app 退出时调用:让 agy daemon 优雅关闭,避免遗留孤儿进程
-    static func shutdownDaemon() {
-        let script = """
-        import sys
-        sys.path.insert(0, \(probeDirQuoted))
-        try:
-            import agy_usage
-            agy_usage._daemon_request('shutdown', 3)
-        except Exception:
-            pass
-        """
-        let proc = makeProcess(args: ["-c", script])
-        proc.standardOutput = Pipe()
-        proc.standardError = Pipe()
-        do { try proc.run(); proc.waitUntilExit() } catch {}
-    }
-    private static var probeDirQuoted: String {
-        "\"" + probeDir.replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"") + "\""
-    }
-
     // 复用:带补全 PATH 的 Python 进程
     private static func makeProcess(args: [String]) -> Process {
         let proc = Process()
@@ -119,8 +98,5 @@ enum QuotaFetcher {
         env["PATH"] = (extraPaths.joined(separator: ":") + ":" + existing)
         proc.environment = env
         return proc
-    }
-    private static var probeDir: String {
-        (probePath as NSString).deletingLastPathComponent
     }
 }

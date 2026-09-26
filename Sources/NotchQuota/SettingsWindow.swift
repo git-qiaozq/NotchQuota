@@ -1,6 +1,44 @@
 import AppKit
 import ServiceManagement
 
+// 开机自启:SMAppService 注册 + 意图持久化
+// 意图存 UserDefaults;系统真状态被外部改掉时(系统设置里关过),下次启动纠正回来
+enum LaunchAtLogin {
+    private static let syncedKey = "launchAtLoginSyncedState"
+
+    /// 上次生效的注册意图;nil 表示从未在 app 内操作过(跟随系统真状态)
+    static var intended: Bool? {
+        UserDefaults.standard.object(forKey: syncedKey) as? Bool
+    }
+
+    static var isEnabled: Bool {
+        SMAppService.mainApp.status == .enabled
+    }
+
+    static func persistIntent(_ on: Bool) {
+        UserDefaults.standard.set(on, forKey: syncedKey)
+    }
+
+    static func register(_ on: Bool) throws {
+        if on { try SMAppService.mainApp.register() }
+        else { try SMAppService.mainApp.unregister() }
+    }
+
+    /// 意图与系统真状态不一致时纠正一次(app 启动、设置窗口打开时调用)
+    /// 返回诊断串,便于启动时落 debug.log 排查注册结果
+    @discardableResult
+    static func reapplyIfNeeded() -> String {
+        guard let intended = intended else { return "no-intent enabled=\(isEnabled)" }
+        guard isEnabled != intended else { return "in-sync intended=\(intended)" }
+        do {
+            try register(intended)
+            return "registered intended=\(intended) nowEnabled=\(isEnabled)"
+        } catch {
+            return "register-failed intended=\(intended) error=\(error.localizedDescription)"
+        }
+    }
+}
+
 // 设置窗口:左侧品牌区(图标/名称/版本/退出),右侧设置列表(自启/触发方式/卡片选择)
 // 关窗口不会退出 app(刘海功能继续运行),只有点"完全退出"才终止进程
 final class SettingsWindowController: NSObject, NSWindowDelegate {
@@ -8,9 +46,6 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     static let shared = SettingsWindowController()
     private var window: NSWindow?
     private var launchSwitch: NSSwitch?
-
-    // 上次生效的自启注册结果(持久化):据此判断"开关意图"与"系统真状态"是否被外部改过
-    private static let launchSyncedKey = "launchAtLoginSyncedState"
 
     func show() {
         if let w = window {
@@ -190,29 +225,17 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     // ── 开机自启 ──
     // 开关状态以"上次注册意图"(持久化)为准,与系统真状态不一致时纠正一次(用户在系统设置里改过)
     private func syncLaunchSwitch() {
-        let enabled = SMAppService.mainApp.status == .enabled
-        let synced = UserDefaults.standard.object(forKey: Self.launchSyncedKey) as? Bool
-        let intended = synced ?? enabled
-        if synced != nil, enabled != intended {
-            reapplyLaunchAtLogin(intended)
-        }
+        LaunchAtLogin.reapplyIfNeeded()
+        let intended = LaunchAtLogin.intended ?? LaunchAtLogin.isEnabled
         launchSwitch?.state = intended ? .on : .off
-    }
-
-    private func reapplyLaunchAtLogin(_ enable: Bool) {
-        do {
-            if enable { try SMAppService.mainApp.register() }
-            else { try SMAppService.mainApp.unregister() }
-        } catch { /* 纠正失败静默,下次打开窗口再试 */ }
     }
 
     @objc private func toggleLaunchAtLogin() {
         guard let sw = launchSwitch else { return }
         let wantOn = sw.state == .on
         do {
-            if wantOn { try SMAppService.mainApp.register() }
-            else { try SMAppService.mainApp.unregister() }
-            UserDefaults.standard.set(wantOn, forKey: Self.launchSyncedKey)
+            try LaunchAtLogin.register(wantOn)
+            LaunchAtLogin.persistIntent(wantOn)
         } catch {
             sw.state = wantOn ? .off : .on
             NSSound.beep()
