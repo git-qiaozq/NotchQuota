@@ -206,8 +206,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         // ── 触发方式行 ──
         let triggerRow = makeRow(y: pad)
         let triggerMain = rowMainLabel("弹出位置")
-        let triggerHint = rowHintLabel("悬停刘海,或划入屏幕右上角")
-        let modeSwitch = TriggerModeSwitch(frame: NSRect(x: 0, y: 0, width: 196, height: 28))
+        let triggerHint = rowHintLabel("悬停刘海,或划入屏幕角落")
+        let modeSwitch = TriggerModeSwitch(frame: NSRect(x: 0, y: 0, width: 220, height: 28))
         modeSwitch.setMode(QuotaDisplayPreferences.triggerMode, animated: false)
         modeSwitch.onChange = { QuotaDisplayPreferences.triggerMode = $0 }
         modeSwitch.frame.origin = NSPoint(x: rowW - modeSwitch.frame.width - 12,
@@ -443,7 +443,7 @@ final class CardOrderRowView: NSView {
     }
 }
 
-// 触发方式选择开关:HUD 风格滑动开关
+// 触发方式选择开关:HUD 风格滑动分段开关(N 段)
 // 渐变滑块(薄荷绿→青) + 霓虹辉光呼吸 + 弹簧滑动 + 选中扫光 + 四角瞄准框
 final class TriggerModeSwitch: NSView {
     override var mouseDownCanMoveWindow: Bool { false }
@@ -451,12 +451,13 @@ final class TriggerModeSwitch: NSView {
     var onChange: ((QuotaTriggerMode) -> Void)?
     private(set) var mode: QuotaTriggerMode = .notch
 
+    private let modes: [QuotaTriggerMode] = [.notch, .topLeftCorner, .topRightCorner]
+
     private let trackLayer = CALayer()
     private let thumb = CAGradientLayer()
     private let shimmer = CAGradientLayer()
     private let brackets = CAShapeLayer()
-    private let leftLabel = CATextLayer()
-    private let rightLabel = CATextLayer()
+    private var segmentLabels: [CATextLayer] = []
     private var ta: NSTrackingArea?
 
     private let pad: CGFloat = 3
@@ -513,14 +514,15 @@ final class TriggerModeSwitch: NSView {
         brackets.opacity = 0.55
         root.addSublayer(brackets)
 
-        for l in [leftLabel, rightLabel] {
+        for m in modes {
+            let l = CATextLayer()
             l.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
             l.fontSize = 12
             l.alignmentMode = .center
+            l.string = m.shortName
             root.addSublayer(l)
+            segmentLabels.append(l)
         }
-        leftLabel.string = QuotaTriggerMode.notch.displayName
-        rightLabel.string = QuotaTriggerMode.topRightCorner.displayName
         applyLabelColors(animated: false)
     }
 
@@ -596,16 +598,21 @@ final class TriggerModeSwitch: NSView {
         let off = NSColor(white: 1, alpha: 0.55).cgColor
         CATransaction.begin()
         CATransaction.setAnimationDuration(animated ? 0.25 : 0)
-        leftLabel.foregroundColor = mode == .notch ? on : off
-        rightLabel.foregroundColor = mode == .notch ? off : on
+        for (i, l) in segmentLabels.enumerated() {
+            l.foregroundColor = modes[i] == mode ? on : off
+        }
         CATransaction.commit()
     }
 
+    private func segmentWidth() -> CGFloat {
+        (bounds.width - pad * 2) / CGFloat(modes.count)
+    }
+
     private func thumbFrame(for m: QuotaTriggerMode) -> CGRect {
-        let w = (bounds.width - pad * 2) / 2
+        let w = segmentWidth()
         let h = bounds.height - pad * 2
-        let x = m == .notch ? pad : bounds.width - pad - w
-        return CGRect(x: x, y: pad, width: w, height: h)
+        let idx = modes.firstIndex(of: m) ?? 0
+        return CGRect(x: pad + w * CGFloat(idx), y: pad, width: w, height: h)
     }
 
     // 四角瞄准框(HUD 取景框),臂长 arm 的 L 形角标
@@ -631,10 +638,12 @@ final class TriggerModeSwitch: NSView {
         shimmer.bounds = thumb.bounds
         shimmer.position = thumb.position
         shimmer.cornerRadius = thumb.cornerRadius
-        let halfW = bounds.width / 2
         let labelH: CGFloat = 15
-        leftLabel.frame = CGRect(x: 0, y: (bounds.height - labelH) / 2, width: halfW, height: labelH)
-        rightLabel.frame = CGRect(x: halfW, y: (bounds.height - labelH) / 2, width: halfW, height: labelH)
+        for (i, l) in segmentLabels.enumerated() {
+            l.frame = CGRect(x: pad + segmentWidth() * CGFloat(i),
+                             y: (bounds.height - labelH) / 2,
+                             width: segmentWidth(), height: labelH)
+        }
         brackets.frame = bounds
         brackets.path = bracketsPath(rect: bounds.insetBy(dx: -4.5, dy: -4.5), arm: 7)
         CATransaction.commit()
@@ -643,8 +652,7 @@ final class TriggerModeSwitch: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         let s = window?.backingScaleFactor ?? 2
-        leftLabel.contentsScale = s
-        rightLabel.contentsScale = s
+        segmentLabels.forEach { $0.contentsScale = s }
     }
 
     override func updateTrackingAreas() {
@@ -673,8 +681,9 @@ final class TriggerModeSwitch: NSView {
 
     override func mouseUp(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
-        guard bounds.contains(p) else { return }
-        let m: QuotaTriggerMode = p.x < bounds.midX ? .notch : .topRightCorner
+        guard bounds.contains(p), segmentWidth() > 0 else { return }
+        let idx = max(0, min(modes.count - 1, Int((p.x - pad) / segmentWidth())))
+        let m = modes[idx]
         if m != mode {
             setMode(m, animated: true)
             onChange?(m)

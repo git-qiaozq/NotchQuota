@@ -15,14 +15,14 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var refreshTimer: Timer?
     private var isRefreshing = false
     private var isOpen = false
-    private var openedInCornerMode = false   // 本次展开使用的触发方式(决定收起动画形态)
+    private var openedCorner: PanelCorner?   // 本次展开贴哪侧屏幕角(nil=刘海模式),决定收起动画形态
     private var animationGeneration = 0      // 展开/收起共用代次,防止旧回调隐藏重新打开的面板
     private var closeWorkItem: DispatchWorkItem?   // 延迟收起任务
     private var notchHotRect: NSRect = .zero        // 收起态刘海热区矩形
     private var currentTargetFrame: NSRect?         // 展开后面板目标矩形
     private var pollTimer: Timer?                   // 兜底:打开后轮询光标真实位置,防止 tracking area 失效导致不收回
 
-    private let panelWidth: CGFloat = 362
+    private let panelWidth: CGFloat = 350
     private let hideInset: CGFloat = 8             // 收起时藏到屏幕顶外的余量
     private let hoverSlop: CGFloat = 24            // 热区比刘海左右各宽容多少
     private let closeDelay: TimeInterval = 0.0     // 鼠标移出后立即收起(0延迟,下一tick执行避免过渡抖动)
@@ -140,7 +140,19 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     // ── 热区矩形:按触发方式计算 ──
     // 刘海模式:覆盖刘海本身 + 下方一小条,左右宽容
-    // 右上角模式:贴死屏幕右上角的一小块,光标甩进角落即触发(类触发角)
+    // 角落模式:贴死屏幕左上/右上角的一小块,光标甩进角落即触发(类触发角)
+    // 角落触发时面板贴哪一侧(决定展开位置与辐射动画锚点)
+    private enum PanelCorner {
+        case left, right
+    }
+    private var cornerMode: PanelCorner? {
+        switch QuotaDisplayPreferences.triggerMode {
+        case .notch: return nil
+        case .topLeftCorner: return .left
+        case .topRightCorner: return .right
+        }
+    }
+
     private func hotZoneRect(for screen: NSScreen) -> NSRect {
         let sf = screen.frame
         switch QuotaDisplayPreferences.triggerMode {
@@ -151,6 +163,9 @@ final class AppController: NSObject, NSApplicationDelegate {
                           y: sf.maxY - g.height - belowExtra,
                           width: g.width + hoverSlop * 2,
                           height: g.height + belowExtra)
+        case .topLeftCorner:
+            let s: CGFloat = 16
+            return NSRect(x: sf.minX, y: sf.maxY - s, width: s, height: s)
         case .topRightCorner:
             let s: CGFloat = 16
             return NSRect(x: sf.maxX - s, y: sf.maxY - s, width: s, height: s)
@@ -236,12 +251,17 @@ final class AppController: NSObject, NSApplicationDelegate {
         // 展开面板时按需强制刷新(层1的"按需"部分):Claude 会跳过缓存取实时
         refresh(force: true)
         // 刘海模式:顶部留出刘海融合区并水平居中包裹刘海
-        // 右上角模式:无融合区,面板贴屏幕右缘并多出 1pt,把右缘边线推出可视区
+        // 角落模式:无融合区,面板贴屏幕对应侧缘并多出 1pt,把边缘边线推出可视区
         // (与角落热区连成一片,光标贴边下移不脱开)
-        let cornerMode = QuotaDisplayPreferences.triggerMode == .topRightCorner
-        openedInCornerMode = cornerMode
-        panelView.notchInset = cornerMode ? 0 : g.height
-        let targetX = cornerMode ? sf.maxX - panelWidth + 1 : g.center - panelWidth / 2
+        let corner = cornerMode
+        openedCorner = corner
+        panelView.notchInset = corner != nil ? 0 : g.height
+        let targetX: CGFloat
+        switch corner {
+        case .right: targetX = sf.maxX - panelWidth + 1
+        case .left:  targetX = sf.minX - 1
+        case nil:    targetX = g.center - panelWidth / 2
+        }
         // fittingSize 已含 notchInset → 总高度 = 刘海融合区 + 内容
         let totalH = panelView.fittingSize.height
         // 目标:顶部超出屏幕顶 2pt,刚好盖住那条 1px 边线,不浪费可视空间
@@ -251,10 +271,10 @@ final class AppController: NSObject, NSApplicationDelegate {
         currentTargetFrame = target
         debugLog("OPEN totalH=\(totalH) target=\(target.origin.x),\(target.origin.y) \(target.width)x\(target.height) | topY=\(target.origin.y+target.height) sfMaxY=\(sf.maxY) actualBefore=\(panelWindow.frame)")
 
-        if cornerMode {
-            // 窗口直接就位,内容层从右上角辐射放大(见 playRadiateFromCorner)
+        if let corner {
+            // 窗口直接就位,内容层从角落辐射放大(见 playRadiateFromCorner)
             panelWindow.setFrame(target, display: false)
-            playRadiateFromCorner()
+            playRadiateFromCorner(corner)
         } else {
             // 起始:完全藏在屏幕顶外
             let start = NSRect(x: target.origin.x, y: sf.maxY + hideInset,
@@ -274,7 +294,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
     }
 
-    // ── 收起:滑回屏幕顶外(藏到刘海后) / 缩回右上角 ──
+    // ── 收起:滑回屏幕顶外(藏到刘海后) / 缩回角落 ──
     private func closePanel() {
         guard isOpen else { return }
         isOpen = false
@@ -290,14 +310,14 @@ final class AppController: NSObject, NSApplicationDelegate {
         let cur = panelWindow.frame
         let hidden = NSRect(x: cur.origin.x, y: sf.maxY + hideInset,
                             width: cur.width, height: cur.height)
-        if openedInCornerMode {
-            // 缩回右上角 + 淡出(显式动画:AppKit 的 layer-backed 视图不支持隐式动画)
+        if let corner = openedCorner {
+            // 缩回角落 + 淡出(显式动画:AppKit 的 layer-backed 视图不支持隐式动画)
             guard let layer = panelWindow.contentView?.layer else {
                 panelWindow.orderOut(nil)
                 panelWindow.setFrame(hidden, display: false)
                 return
             }
-            setRadiateAnchor(atCorner: true)
+            setRadiateAnchor(corner)
             // 从当前展示状态开始缩(展开动画中途收起也能平滑接管)
             let fromT = layer.presentation()?.transform ?? layer.transform
             let fromO = layer.presentation()?.opacity ?? layer.opacity
@@ -343,15 +363,15 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
     }
 
-    // ── 右上角辐射动画 ──
+    // ── 角落辐射动画 ──
     // 窗口直接放在目标位,只对内容层做 transform(窗口 frame 不动,活跃区判断不受影响)
-    private func playRadiateFromCorner() {
+    private func playRadiateFromCorner(_ corner: PanelCorner) {
         guard let contentView = panelWindow.contentView, let layer = contentView.layer else {
             panelWindow.orderFrontRegardless()
             startPolling()
             return
         }
-        setRadiateAnchor(atCorner: true)
+        setRadiateAnchor(corner)
         // 若是在收起动画中途重新展开,从当前展示状态接着放大,避免跳变
         let interrupted = layer.animation(forKey: "radiateOut") != nil
         let startT = interrupted
@@ -398,15 +418,19 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
     }
 
-    // 内容层锚点钉到右上角(辐射源)或还原到中心;不触发隐式动画
-    private func setRadiateAnchor(atCorner: Bool) {
+    // 内容层锚点钉到角落(辐射源)或还原到中心;不触发隐式动画
+    private func setRadiateAnchor(_ corner: PanelCorner?) {
         guard let contentView = panelWindow.contentView, let layer = contentView.layer else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        if atCorner {
+        switch corner {
+        case .right:
             layer.anchorPoint = CGPoint(x: 1, y: 1)
             layer.position = CGPoint(x: contentView.frame.maxX, y: contentView.frame.maxY)
-        } else {
+        case .left:
+            layer.anchorPoint = CGPoint(x: 0, y: 1)
+            layer.position = CGPoint(x: contentView.frame.minX, y: contentView.frame.maxY)
+        case nil:
             layer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
             layer.position = CGPoint(x: contentView.frame.midX, y: contentView.frame.midY)
         }

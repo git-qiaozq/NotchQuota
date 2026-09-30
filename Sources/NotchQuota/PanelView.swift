@@ -4,7 +4,7 @@ import AppKit
 final class PanelView: NSView {
     private let stack = NSStackView()
     private var onClickURL: ((String) -> Void)?
-    // 顶部留给刘海融合的空白高度;右上角触发模式下为 0
+    // 顶部留给刘海融合的空白高度;角落触发模式下为 0
     var notchInset: CGFloat {
         didSet {
             stack.edgeInsets = NSEdgeInsets(top: notchInset + 14,

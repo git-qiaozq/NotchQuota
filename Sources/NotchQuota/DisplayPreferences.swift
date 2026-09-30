@@ -5,15 +5,26 @@ extension Notification.Name {
     static let quotaTriggerModeDidChange = Notification.Name("quotaTriggerModeDidChange")
 }
 
-// 面板触发方式:刘海悬停,或屏幕右上角触发(类触发角)
+// 面板触发方式:刘海悬停,或屏幕左上/右上角触发(类触发角)
 enum QuotaTriggerMode: String {
     case notch
+    case topLeftCorner
     case topRightCorner
 
     var displayName: String {
         switch self {
         case .notch: return "刘海悬停"
+        case .topLeftCorner: return "左上角触发"
         case .topRightCorner: return "右上角触发"
+        }
+    }
+
+    // 设置开关分段里的短标签(分段窄,省略"触发")
+    var shortName: String {
+        switch self {
+        case .notch: return "刘海悬停"
+        case .topLeftCorner: return "左上角"
+        case .topRightCorner: return "右上角"
         }
     }
 }
