@@ -112,16 +112,19 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         quitHint.textColor = NSColor(white: 0.42, alpha: 1)
         quitHint.alignment = .center
         quitHint.sizeToFit()
-        quitHint.frame = NSRect(x: 0, y: 18, width: sideW, height: quitHint.frame.height)
+        quitHint.frame = NSRect(x: 0, y: 12, width: sideW, height: quitHint.frame.height)
 
-        let versionLbl = NSTextField(labelWithString: "v0.1")
-        versionLbl.font = .systemFont(ofSize: 10)
-        versionLbl.textColor = NSColor(white: 0.38, alpha: 1)
-        versionLbl.alignment = .center
-        versionLbl.sizeToFit()
-        versionLbl.frame = NSRect(x: 0, y: 2, width: sideW, height: versionLbl.frame.height)
+        // ── 关于信息卡:版本 / 作者 / 源码,垂直居中于副标题与退出按钮之间的空白区 ──
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1"
+        let infoCard = makeInfoCard(width: sideW - 32, version: version)
+        let emptyTop = subLbl.frame.minY
+        let emptyBottom = quitBtn.frame.maxY
+        infoCard.frame.origin = NSPoint(
+            x: 16,
+            y: emptyBottom + (emptyTop - emptyBottom - infoCard.frame.height) / 2
+        )
 
-        [icon, nameLbl, subLbl, quitBtn, quitHint, versionLbl].forEach { sidebar.addSubview($0) }
+        [icon, nameLbl, subLbl, quitBtn, quitHint, infoCard].forEach { sidebar.addSubview($0) }
 
         // ── 分隔线 ──
         let sep = NSView(frame: NSRect(x: sideW, y: 0, width: 1, height: H))
@@ -245,6 +248,64 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     @objc private func quitApp() {
         window?.close()
         NSApp.terminate(nil)
+    }
+
+    // ── 关于信息卡:左侧品牌区中部的版本/作者/源码分组 ──
+    // 样式与右栏分组行一致(5% 白底 + 12 圆角 + 0.5 描边),行间细分隔线
+    private func makeInfoCard(width w: CGFloat, version: String) -> NSView {
+        let rowH: CGFloat = 34
+        let inset: CGFloat = 14
+        let rows: [(title: String, value: String, isLink: Bool)] = [
+            ("版本", "v\(version)", false),
+            ("作者", "qiaozq", false),
+            ("源码", "GitHub ↗", true),
+        ]
+        let card = NSView(frame: NSRect(x: 0, y: 0, width: w,
+                                        height: rowH * CGFloat(rows.count) + CGFloat(rows.count - 1) * 0.5))
+        card.wantsLayer = true
+        card.layer?.backgroundColor = NSColor(white: 1, alpha: 0.05).cgColor
+        card.layer?.cornerRadius = 12
+        card.layer?.borderColor = NSColor(white: 1, alpha: 0.07).cgColor
+        card.layer?.borderWidth = 0.5
+
+        for (i, row) in rows.enumerated() {
+            let rowY = card.frame.height - rowH * CGFloat(i + 1) - CGFloat(i) * 0.5
+            let titleLbl = NSTextField(labelWithString: row.title)
+            titleLbl.font = .systemFont(ofSize: 11)
+            titleLbl.textColor = NSColor(white: 0.52, alpha: 1)
+            titleLbl.sizeToFit()
+            titleLbl.frame.origin = NSPoint(x: inset, y: rowY + (rowH - titleLbl.frame.height) / 2)
+            card.addSubview(titleLbl)
+
+            let valueLbl: NSTextField = row.isLink
+                ? LinkLabel(labelWithString: row.value)
+                : NSTextField(labelWithString: row.value)
+            valueLbl.font = .systemFont(ofSize: 11, weight: .medium)
+            valueLbl.textColor = row.isLink
+                ? NSColor(calibratedRed: 0.30, green: 0.82, blue: 0.95, alpha: 1)   // 链接用开关的青色强调
+                : NSColor(white: 0.88, alpha: 1)
+            valueLbl.sizeToFit()
+            valueLbl.frame.origin = NSPoint(x: w - inset - valueLbl.frame.width,
+                                            y: rowY + (rowH - valueLbl.frame.height) / 2)
+            if row.isLink {
+                valueLbl.addGestureRecognizer(
+                    NSClickGestureRecognizer(target: self, action: #selector(openRepo)))
+            }
+            card.addSubview(valueLbl)
+
+            if i < rows.count - 1 {
+                let sep = NSView(frame: NSRect(x: inset, y: rowY - 0.5,
+                                               width: w - inset * 2, height: 0.5))
+                sep.wantsLayer = true
+                sep.layer?.backgroundColor = NSColor(white: 1, alpha: 0.07).cgColor
+                card.addSubview(sep)
+            }
+        }
+        return card
+    }
+
+    @objc private func openRepo() {
+        NSWorkspace.shared.open(URL(string: "https://github.com/git-qiaozq/NotchQuota")!)
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -688,6 +749,13 @@ final class TriggerModeSwitch: NSView {
             setMode(m, animated: true)
             onChange?(m)
         }
+    }
+}
+
+// 可点击的链接文本:手型光标,点击手势由外部挂接
+final class LinkLabel: NSTextField {
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
     }
 }
 
