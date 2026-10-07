@@ -513,10 +513,43 @@ def probe_claude() -> dict:
     return result
 
 
+# ─────────────────────── API key 来源 ───────────────────────
+# 所有服务商的 key 都由 NotchQuota 自己保管,不依赖任何 agent 工具的配置。
+# 查找顺序: macOS Keychain(service = NotchQuota/<服务商>)
+#   → ~/.config/notchquota/keys.env(KEY=VALUE 每行一个)。
+# 写入 Keychain 示例:
+#   security add-generic-password -s NotchQuota/kimi -a "$USER" -w <key>
+
+_KEYS_ENV = os.path.join(HOME, ".config", "notchquota", "keys.env")
+
+
+def _find_key(keychain_service: str, env_names) -> str:
+    """Keychain → NotchQuota keys.env,找到第一个非空 key。"""
+    try:
+        r = subprocess.run(
+            ["security", "find-generic-password", "-s", keychain_service, "-w"],
+            capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            key = r.stdout.strip()
+            if key:
+                return key
+    except Exception:
+        pass
+
+    pat = re.compile(r'\s*(' + '|'.join(env_names) + r')\s*=\s*["\']?([A-Za-z0-9._\-]+)')
+    try:
+        with open(_KEYS_ENV) as f:
+            for line in f:
+                m = pat.match(line)
+                if m:
+                    return m.group(2)
+    except Exception:
+        pass
+    return ""
+
+
 # ─────────────────────── Z.AI Coding Plan ───────────────────────
 # 用 Z.AI/GLM 的 API key 查 coding plan 真实配额。
-# key 查找顺序: Keychain(NotchQuota/zai) → ~/.config/notchquota/keys.env
-#   → ~/.hermes/.env(向后兼容,历史来源)。
 # bigmodel.cn(中国站)与 api.z.ai(全球站)账号体系不互通,两站接口都试,
 # 记住上次成功的站,避免每次都先撞一次 401。
 
@@ -530,34 +563,8 @@ _zai_last_good = ""          # 上次成功站点的 url,优先重试(app 每次
 
 
 def _zai_find_key() -> str:
-    """Keychain → NotchQuota keys.env → Hermes .env,找到第一个非空 key。"""
-    try:
-        r = subprocess.run(
-            ["security", "find-generic-password", "-s", _ZAI_KEYCHAIN_SERVICE, "-w"],
-            capture_output=True, text=True, timeout=5)
-        if r.returncode == 0:
-            key = r.stdout.strip()
-            if key:
-                return key
-    except Exception:
-        pass
-
-    keys = ["ZAI_API_KEY", "GLM_API_KEY", "Z_AI_API_KEY", "ZHIPUAI_API_KEY"]
-    pat = re.compile(r'\s*(' + '|'.join(keys) + r')\s*=\s*["\']?([A-Za-z0-9._\-]+)')
-    envs = [os.path.join(HOME, ".config", "notchquota", "keys.env"),
-            os.path.join(HOME, ".hermes", ".env")]
-    for env in envs:
-        if not os.path.exists(env):
-            continue
-        try:
-            with open(env) as f:
-                for line in f:
-                    m = pat.match(line)
-                    if m:
-                        return m.group(2)
-        except Exception:
-            pass
-    return ""
+    return _find_key(_ZAI_KEYCHAIN_SERVICE,
+                     ["ZAI_API_KEY", "GLM_API_KEY", "Z_AI_API_KEY", "ZHIPUAI_API_KEY"])
 
 
 def _zai_fetch_limits(key: str):
@@ -619,7 +626,7 @@ def probe_hermes() -> dict:
     try:
         key = _zai_find_key()
         if not key:
-            out["detail"] = "未配置 Z.AI key"
+            out["detail"] = "未配置 Z.AI key(请写入 keys.env)"
             return out
 
         limits, err = _zai_fetch_limits(key)
@@ -662,23 +669,13 @@ def probe_hermes() -> dict:
 
 
 # ───────────────────────── Kimi ─────────────────────────
-# Kimi Code (Coding Plan) 用量: 用 Hermes .env 里的 KIMI_API_KEY 调
+# Kimi Code (Coding Plan) 用量: 用 KIMI_API_KEY 调
 # api.kimi.com/coding/v1/usages。响应含 usage(周窗口) + limits[](5h 窗口),
 # limit/used 都是字符串形式的"次数"(总额 100)。
 
 def _kimi_find_key() -> str:
-    """从 Hermes .env 读 Kimi Code API key。"""
-    env = os.path.join(HOME, ".hermes", ".env")
-    if not os.path.exists(env):
-        return ""
-    keys = ["KIMI_API_KEY", "KIMI_CN_API_KEY", "KIMI_CODING_API_KEY"]
-    pat = re.compile(r'\s*(' + '|'.join(keys) + r')\s*=\s*["\']?([A-Za-z0-9._\-]+)')
-    with open(env) as f:
-        for line in f:
-            m = pat.match(line)
-            if m:
-                return m.group(2)
-    return ""
+    return _find_key("NotchQuota/kimi",
+                     ["KIMI_API_KEY", "KIMI_CN_API_KEY", "KIMI_CODING_API_KEY"])
 
 
 def _kimi_parse_reset(reset_time: str) -> float:
@@ -700,7 +697,7 @@ def probe_kimi() -> dict:
     try:
         key = _kimi_find_key()
         if not key:
-            out["detail"] = "未配置 Kimi key"
+            out["detail"] = "未配置 Kimi key(请写入 keys.env)"
             return out
 
         import urllib.request, urllib.error
@@ -773,18 +770,7 @@ def probe_kimi() -> dict:
 # 国内直连、请求轻量,无需缓存/退避(和 Z.AI/Kimi 同级)。
 
 def _deepseek_find_key() -> str:
-    """从 Hermes .env 读 DeepSeek API key。"""
-    env = os.path.join(HOME, ".hermes", ".env")
-    if not os.path.exists(env):
-        return ""
-    keys = ["DEEPSEEK_API_KEY", "DEEPSEEK_KEY"]
-    pat = re.compile(r'\s*(' + '|'.join(keys) + r')\s*=\s*["\']?([A-Za-z0-9._\-]+)')
-    with open(env) as f:
-        for line in f:
-            m = pat.match(line)
-            if m:
-                return m.group(2)
-    return ""
+    return _find_key("NotchQuota/deepseek", ["DEEPSEEK_API_KEY", "DEEPSEEK_KEY"])
 
 
 def probe_deepseek() -> dict:
@@ -799,7 +785,7 @@ def probe_deepseek() -> dict:
     try:
         key = _deepseek_find_key()
         if not key:
-            out["detail"] = "未配置 DeepSeek key"
+            out["detail"] = "未配置 DeepSeek key(请写入 keys.env)"
             return out
 
         import urllib.request, urllib.error
